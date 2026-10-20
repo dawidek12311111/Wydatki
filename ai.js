@@ -41,7 +41,7 @@ export function buildAIContext(data, ym, opts = {}) {
       .map((c) => ({ kategoria: catName(c.categoryId), teraz: zl(c.now), wczesniej: zl(c.before), roznica: zl(c.diff) })),
     ostatnie_6_miesiecy: monthlySeries(txs, ym, 6).map((s) => ({ miesiac: s.ym, przychody: zl(s.income), wydatki: zl(s.expense), bilans: zl(s.net) })),
     srednie_miesieczne: { '3_mies': avg(3), '6_mies': avg(6), '12_mies': avg(12) },
-    majatek: { netto: zl(w.net), aktywa: zl(w.assets), zobowiazania: zl(w.liabilities), oszczednosci_i_inwestycje: sumGroup('savings'), kredyty_do_splaty: -sumGroup('loan'), konta_biezace: sumGroup('current') },
+    majatek: { netto: zl(w.net), aktywa: zl(w.assets), zobowiazania: zl(w.liabilities), oszczednosci_i_inwestycje: sumGroup('savings'), nieruchomosci_i_inne_aktywa: sumGroup('property'), kredyty_do_splaty: -sumGroup('loan'), konta_biezace: sumGroup('current') },
     plan_miesiaca: {
       planowane_wplywy: zl(plan.income.total), juz_wplynelo: zl(plan.income.done),
       planowane_oplaty: zl(plan.expense.total), juz_zaplacone: zl(plan.expense.done), planowana_nadwyzka: zl(plan.plannedNet),

@@ -10,11 +10,73 @@
   "background_color": "#f4f6f5",
   "theme_color": "#0f766e",
   "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
   ],
   "shortcuts": [
-    { "name": "Dodaj transakcję", "url": "./#transactions" }
+    {
+      "name": "Dodaj wydatek",
+      "short_name": "Wydatek",
+      "url": "./?add=expense#transactions",
+      "icons": [
+        {
+          "src": "shortcut-expense.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Dodaj przychód",
+      "short_name": "Przychód",
+      "url": "./?add=income#transactions",
+      "icons": [
+        {
+          "src": "shortcut-income.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Dyktuj wydatek",
+      "short_name": "Dyktuj",
+      "url": "./?add=voice#transactions",
+      "icons": [
+        {
+          "src": "shortcut-voice.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Plan miesiąca",
+      "short_name": "Plan",
+      "url": "./#budget",
+      "icons": [
+        {
+          "src": "shortcut-plan.png",
+          "sizes": "96x96",
+          "type": "image/png"
+        }
+      ]
+    }
   ]
 }

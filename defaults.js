@@ -54,9 +54,20 @@ export const SAVINGS_KINDS = {
   other: { label: 'Inne', icon: '💰', type: 'investment' },
 };
 
+/** Nieruchomości i inne aktywa (type: 'property'). growth = domyślna zmiana wartości % rocznie w symulacji. */
+export const PROPERTY_KINDS = {
+  flat: { label: 'Mieszkanie', icon: '🏢', growth: 3 },
+  house: { label: 'Dom', icon: '🏠', growth: 3 },
+  land: { label: 'Działka', icon: '🌳', growth: 4 },
+  garage: { label: 'Garaż / miejsce', icon: '🅿️', growth: 2 },
+  car: { label: 'Samochód', icon: '🚗', growth: -10 },
+  property_other: { label: 'Inne', icon: '📦', growth: 0 },
+};
+
 /** Grupa w zakładce Majątek. */
 export function accountGroup(a) {
   if (a.type === 'loan') return 'loan';
+  if (a.type === 'property') return 'property';
   if (a.type === 'savings' || a.type === 'investment') return 'savings';
   return 'current';
 }

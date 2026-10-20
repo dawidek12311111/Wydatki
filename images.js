@@ -2,18 +2,11 @@
 // Domyślnie zapisujemy MAŁĄ KOPIĘ w telefonie (data URL) — potem nic już nie jest pobierane z sieci.
 // Bezpośrednie wyświetlanie z serwera tylko z listy darmowych serwerów i tylko po zgodzie użytkownika.
 
-/** Darmowe serwery obrazków, z których aplikacja może pobrać obrazek (to samo jest w CSP w index.html). */
+/** Serwery darmowych obrazków (wolne licencje), z których można pobrać wybrany obrazek. To samo jest w CSP w index.html. */
 export const IMAGE_HOSTS = [
-  'icons.duckduckgo.com', // logo firm po nazwie domeny
-  'upload.wikimedia.org', // Wikipedia / Wikimedia Commons
-  'images.unsplash.com', // Unsplash
-  'cdn.pixabay.com', // Pixabay
-  'images.pexels.com', // Pexels
-  'i.imgur.com', // Imgur
-  'cdn.jsdelivr.net', // m.in. darmowe zestawy ikon i logo (simple-icons)
-  'raw.githubusercontent.com', // Twoje pliki na GitHubie
+  'api.openverse.org', // Openverse — wyszukiwarka obrazów na licencjach Creative Commons
+  'upload.wikimedia.org', // Wikimedia Commons
 ];
-const GITHUB_PAGES = /\.github\.io$/i;
 
 export const ICON_SIZE = 160; // px — wystarczy na ikonę, mało zajmuje
 
@@ -21,7 +14,7 @@ export function isAllowedImageUrl(url) {
   try {
     const u = new URL(url);
     return u.protocol === 'https:' && !u.username && !u.password
-      && (IMAGE_HOSTS.includes(u.hostname.toLowerCase()) || GITHUB_PAGES.test(u.hostname));
+      && IMAGE_HOSTS.includes(u.hostname.toLowerCase());
   } catch {
     return false;
   }
@@ -47,10 +40,6 @@ export function normalizeDomain(input) {
   return /^([a-z0-9-]+\.)+[a-z]{2,}$/.test(s) && !s.split('.').some((p) => p.startsWith('-') || p.endsWith('-')) ? s : null;
 }
 
-export function logoUrl(domain) {
-  const d = normalizeDomain(domain);
-  return d ? `https://icons.duckduckgo.com/ip3/${d}.ico` : null;
-}
 
 // ---------- w przeglądarce ----------
 
@@ -115,4 +104,38 @@ export async function imageFromUrl(url, fit = 'contain') {
   const blob = await res.blob();
   if (blob.size > 10 * 1024 * 1024) throw new Error('Obrazek jest za duży');
   return shrink(blob, fit);
+}
+
+/**
+ * Szukanie darmowych obrazków po tagu (Openverse + Wikimedia Commons).
+ * Wysyłane jest tylko wpisane słowo — żadne Twoje dane.
+ * Zwraca [{ thumb, title, creator, license, source }].
+ */
+export async function searchImages(query) {
+  const q = String(query || '').trim();
+  if (!q) throw new Error('Wpisz słowo, np. dom, auto, wakacje');
+  if (!navigator.onLine) throw new Error('Brak internetu');
+  const enc = encodeURIComponent(q);
+  const opts = { credentials: 'omit', referrerPolicy: 'no-referrer' };
+  const out = [];
+  const tasks = [
+    fetch(`https://api.openverse.org/v1/images/?q=${enc}&page_size=18&mature=false`, opts)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        for (const x of j?.results || []) {
+          if (x.thumbnail && isAllowedImageUrl(x.thumbnail)) out.push({ thumb: x.thumbnail, title: x.title || '', creator: x.creator || '', license: `${(x.license || '').toUpperCase()} ${x.license_version || ''}`.trim(), source: 'Openverse' });
+        }
+      }).catch(() => {}),
+    fetch(`https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=${enc}%20filetype:bitmap&gsrnamespace=6&gsrlimit=18&prop=imageinfo&iiprop=url&iiurlwidth=256`, opts)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j) => {
+        for (const page of Object.values(j?.query?.pages || {})) {
+          const info = page.imageinfo?.[0];
+          if (info?.thumburl && isAllowedImageUrl(info.thumburl)) out.push({ thumb: info.thumburl, title: (page.title || '').replace(/^File:|\.[a-z]+$/gi, ''), creator: '', license: 'Wikimedia Commons', source: 'Wikimedia' });
+        }
+      }).catch(() => {}),
+  ];
+  await Promise.all(tasks);
+  if (!out.length) throw new Error('Nic nie znaleziono — spróbuj innego słowa (także po angielsku, np. house, car)');
+  return out.slice(0, 30);
 }

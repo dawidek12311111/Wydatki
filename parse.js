@@ -27,6 +27,17 @@ function takeDate(s, today) {
   return { date: today, rest: s };
 }
 
+/** Ujednolica tekst z dyktowania: „87 zł 40 gr” → „87,40 zł”, „złotych” → „zł”. */
+export function normalizeSpoken(text) {
+  return String(text || '')
+    .replace(/(\d+)\s*(?:zł|zl|złotych|złote|złoty|zlotych|pln)\s*(?:i\s*)?(\d{1,2})\s*(?:gr|groszy|grosze|grosz)\b/gi, (_, z, g) => `${z},${g.padStart(2, '0')} zł`)
+    .replace(/(\d+)\s*(?:przecinek|kropka)\s*(\d{1,2})/gi, '$1,$2')
+    .replace(/\b(złotych|złote|złoty|zlotych)\b/gi, 'zł')
+    .replace(/(\d)\s+(zł)(?=\s|$)/gi, '$1 zł')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function takeAmount(s) {
   // liczba z opcjonalnymi groszami i opcjonalnym "zł"
   const re = /(^|\s)([+-]?)(\d{1,3}(?:[  ]\d{3})+|\d+)(?:[.,](\d{1,2}))?\s*(zł|zl|pln)?(?=\s|$)/i;
@@ -64,7 +75,7 @@ export function guessCategory(description, categories, history = [], kind = 'exp
 
 /** Zwraca { amount (grosze|null), type, date, description, categoryId } */
 export function parseQuick(text, { categories = [], history = [], today = todayISO() } = {}) {
-  let s = ` ${String(text || '').trim()} `;
+  let s = ` ${normalizeSpoken(text)} `;
   const d = takeDate(s, today);
   s = d.rest;
   const a = takeAmount(s);

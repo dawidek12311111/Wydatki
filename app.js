@@ -9,8 +9,11 @@ import { todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, f
 import { parseQuick, guessCategory } from './parse.js';
 import { validateTransaction, validateBackup, validateBill, validatePurchase } from './validate.js';
 import { transactionsToCSV } from './csv.js';
-import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
-import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, logoUrl, normalizeDomain, CorsBlockedError, IMAGE_HOSTS } from './images.js';
+import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, PROPERTY_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
+import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, searchImages, CorsBlockedError } from './images.js';
+import { badgeFor, brandOf, initials } from './avatar.js';
+import { hashPin, verifyPin, lockoutSeconds, PIN_RE, biometricAvailable, registerBiometric, verifyBiometric } from './lock.js';
+import { speechSupported, listen } from './voice.js';
 import { kindOf, paidWithoutTx, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
 import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS, loanInstallment } from './purchases.js';
 import { metalOf, accountValue, bookBalance, investmentResult, valuedNetWorth, applyChange, sortedValuations, metalValue, TROY_OUNCE_G } from './valuation.js';
@@ -19,7 +22,7 @@ import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.7.0';
+export const APP_VERSION = '0.8.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -29,6 +32,9 @@ const state = {
   data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
   plansTab: 'buy',
   prices: null,
+  profile: null,
+  deletedAccounts: [],
+  bioAvailable: false,
   priceProblems: [],
   simSettings: null,
   metalChart: 'gold',
@@ -138,8 +144,15 @@ function download(filename, content, type) {
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
 
+async function loadData() {
+  const data = await db.loadAll();
+  state.deletedAccounts = data.accounts.filter((a) => a.deletedAt);
+  data.accounts = data.accounts.filter((a) => !a.deletedAt);
+  state.data = data;
+}
+
 async function reload() {
-  state.data = await db.loadAll();
+  await loadData();
   render();
 }
 
@@ -179,6 +192,7 @@ function viewDashboard() {
   const s = monthSummary(txs, state.month);
   const parts = [];
   const lp = (id) => `data-lp="card:${id}"`;
+  if (state.profile?.name) parts.push(`<button class="hello link" data-action="profile" style="color:inherit"><span class="av">${profileAvatar()}</span>Cześć, ${esc(state.profile.name)} 👋</button>`);
 
   if (!state.data.transactions.length) {
     parts.push(`<div class="note">👋 Witaj! Zacznij od <b>Majątek</b> → wpisz aktualne salda swoich kont, a potem dodawaj wydatki przyciskiem <b>+</b>.<br>Przytrzymaj dowolny kafelek, żeby zobaczyć więcej opcji.</div>`);
@@ -197,6 +211,7 @@ function viewDashboard() {
 
     quick: () => `<section class="card" ${lp('quick')}><h2>Szybkie dodawanie</h2>
       <div class="qa"><input id="dash-quick" placeholder="np. Biedronka 87,40" autocomplete="off" enterkeyhint="go" aria-label="Szybkie dodawanie">
+      ${speechSupported() ? '<button class="mic" data-action="dash-mic" aria-label="Dyktuj">🎤</button>' : ''}
       <button class="btn primary" data-action="quick-add">Dalej</button></div></section>`,
 
     networth: () => {
@@ -220,7 +235,7 @@ function viewDashboard() {
           <div class="stat"><small>Do zapłaty</small><b class="${ps.expense.left > 0 ? 'neg' : 'pos'}">${money(ps.expense.left)}</b><small>${ps.expense.doneCount}/${ps.expense.count} opłacone</small></div>
           <div class="stat"><small>Zostanie</small><b class="${ps.plannedNet < 0 ? 'neg' : ''}">${money(ps.plannedNet)}</b><small>wg planu</small></div>
         </div>
-        ${open.length ? `<p class="small muted" style="margin:10px 0 0">Czeka: ${open.slice(0, 4).map((b) => ico(b.icon, b.image, { mini: true }) + ' ' + esc(b.name)).join(', ')}${open.length > 4 ? '…' : ''}</p>` : ''}
+        ${open.length ? `<p class="small muted" style="margin:10px 0 0">Czeka: ${open.slice(0, 4).map((b) => billIco(b, '•', { mini: true }) + ' ' + esc(b.name)).join(', ')}${open.length > 4 ? '…' : ''}</p>` : ''}
         ${missingTxNotice(state.month, { short: true })}`
         : '<p class="muted small">Brak planu na ten miesiąc. <a class="link" href="#budget">Zaplanuj</a></p>'}
       </section>`;
@@ -355,7 +370,7 @@ function planRow(b) {
   const openLabel = inc ? 'Jeszcze nie wpłynęło' : 'Niezapłacone';
   return `<div class="item bill ${b.paid ? 'is-paid' : ''}" data-lp="bill:${esc(b.id)}">
     <button class="bill-main" data-action="edit-bill" data-id="${esc(b.id)}">
-      <span class="ico" aria-hidden="true">${ico(b.icon || (inc ? '💰' : '📄'), b.image)}</span>
+      <span class="ico" aria-hidden="true">${billIco(b, inc ? '💰' : '📄')}</span>
       <span class="mid"><span class="t1">${esc(b.name)}${linked ? '<span class="badge">w transakcjach</span>' : ''}</span>
       <span class="t2"><span class="num ${inc ? 'pos' : ''}">${inc ? '+' : ''}${esc(formatMoney(b.amount))}</span>${b.day ? ` · ${b.day}. dnia` : ''}${b.note ? ' · ' + esc(b.note) : ''}</span></span>
     </button>
@@ -414,7 +429,7 @@ async function fixMissingPlanTx() {
     item.txId = await syncPlanTx(item);
     if (item.txId) n++;
     await db.put('bills', item);
-    state.data = await db.loadAll(); // świeże dane dla kolejnej pozycji
+    await loadData(); // świeże dane dla kolejnej pozycji
   }
   await reload();
   toast(`Dodano ${n} transakcji — bilans i saldo konta są już aktualne`);
@@ -570,7 +585,7 @@ function openCopySheet() {
   const fromYm = addMonths(state.month, -1);
   const items = planToCopy(state.data.bills, fromYm, state.month);
   const row = (b, i) => `<div class="copy-row">
-    <label><input type="checkbox" data-copy="${i}" checked> <span>${ico(b.icon, b.image, { mini: true })} ${esc(b.name)}${b.day ? `<small class="muted"> · ${b.day}.</small>` : ''}</span></label>
+    <label><input type="checkbox" data-copy="${i}" checked> <span>${billIco(b, '•', { mini: true })} ${esc(b.name)}${b.day ? `<small class="muted"> · ${b.day}.</small>` : ''}</span></label>
     <input class="copy-amt" data-amt="${i}" inputmode="decimal" value="${esc(minorToInput(b.amount))}" aria-label="Kwota: ${esc(b.name)}">
   </div>`;
   const group = (kind, title) => {
@@ -611,11 +626,13 @@ const isCurrentMonth = () => state.month === monthKey(todayISO());
 
 function accountIcon(a) {
   if (a.type === 'loan') return '📉';
+  if (a.type === 'property') return PROPERTY_KINDS[a.subtype]?.icon || '📦';
   if (a.subtype && SAVINGS_KINDS[a.subtype]) return SAVINGS_KINDS[a.subtype].icon;
   return { checking: '🏦', savings: '🐷', cash: '💵', card: '💳', investment: '📈', other: '📁' }[a.type] || '📁';
 }
 function accountKindLabel(a) {
   if (a.type === 'loan') return 'Kredyt';
+  if (a.type === 'property') return PROPERTY_KINDS[a.subtype]?.label || 'Inne aktywo';
   if (a.subtype && SAVINGS_KINDS[a.subtype]) return SAVINGS_KINDS[a.subtype].label;
   return ACCOUNT_TYPES[a.type] || '';
 }
@@ -631,6 +648,7 @@ function viewWealth() {
   const current = active.filter((a) => accountGroup(a) === 'current');
   const savings = active.filter((a) => accountGroup(a) === 'savings');
   const loans = active.filter((a) => accountGroup(a) === 'loan');
+  const props = active.filter((a) => accountGroup(a) === 'property');
   const archived = state.data.accounts.filter((a) => a.archived);
   const sumPLN = (list, fn) => list.filter((a) => a.currency === 'PLN').reduce((s, a) => s + fn(a), 0);
   const monthWord = esc(monthNamePL(ym).toLowerCase());
@@ -642,7 +660,7 @@ function viewWealth() {
     const showGain = metal || (a.valuations || []).length > 0;
     return `<section class="acard" data-lp="acc:${esc(a.id)}">
       <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
-        <span class="ico">${ico(accountIcon(a), a.image)}</span>
+        <span class="ico">${accIco(a)}</span>
         <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
         <span class="amt num">${esc(formatMoney(r.value, a.currency))}</span>
       </button>
@@ -654,6 +672,25 @@ function viewWealth() {
         <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">${metal ? '− Sprzedaż' : '− Wypłata'}</button>
         ${metal ? '' : `<button class="btn" data-action="valuate" data-id="${esc(a.id)}">📈 Wartość</button>`}
       </div>
+    </section>`;
+  }).join('');
+
+  const propCards = props.map((a) => {
+    const value = bal[a.id];
+    const loan = a.loanId ? state.data.accounts.find((x) => x.id === a.loanId) : null;
+    const debt = loan ? Math.max(0, -bal[loan.id]) : 0;
+    const own = value - debt;
+    const vs = a.purchasePrice ? value - a.purchasePrice : null;
+    return `<section class="acard" data-lp="acc:${esc(a.id)}">
+      <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
+        <span class="ico">${accIco(a)}</span>
+        <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
+        <span class="amt num">${esc(formatMoney(value, a.currency))}</span>
+      </button>
+      ${vs != null ? `<div class="acard-month small">Kupione za <span class="num">${esc(formatMoney(a.purchasePrice, a.currency))}</span>${a.purchaseYear ? ` (${a.purchaseYear})` : ''} · <b class="num ${vs >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(vs, a.currency, { sign: true }))}</b></div>` : ''}
+      ${loan ? `<div class="acard-month small">Kredyt „${esc(loan.name)}”: <span class="num neg">−${esc(formatMoney(debt, a.currency))}</span> · Twoje: <b class="num">${esc(formatMoney(own, a.currency))}</b>${value > 0 ? ` (${Math.round((own / value) * 100)}%)` : ''}</div>
+        <div class="track"><div class="fill" style="width:${value > 0 ? Math.max(0, Math.min(100, (own / value) * 100)).toFixed(1) : 0}%"></div></div>` : ''}
+      <div class="acard-actions one"><button class="btn" data-action="valuate" data-id="${esc(a.id)}">📈 Aktualizuj wartość</button></div>
     </section>`;
   }).join('');
 
@@ -692,13 +729,17 @@ function viewWealth() {
     <button class="btn block" data-action="add-account" data-group="savings">+ Dodaj oszczędności / inwestycję</button>
     ${hasMetals() ? metalPricesCard() : ''}
 
+    <div class="sec-head"><h2>Nieruchomości i inne aktywa</h2><b class="num">${props.length ? esc(formatMoney(sumPLN(props, (a) => bal[a.id]))) : ''}</b></div>
+    ${propCards || '<p class="muted small">Mieszkanie, dom, działka, samochód… — wpisz wartość, a w symulacji zobaczysz ją za X lat.</p>'}
+    <button class="btn block" data-action="add-account" data-group="property">+ Dodaj nieruchomość / aktywo</button>
+
     <div class="sec-head"><h2>Kredyty</h2><b class="num">${loans.length ? esc(formatMoney(sumPLN(loans, (a) => -bal[a.id]))) : ''}</b></div>
     ${loanCards ? `<p class="small muted" style="margin:0 4px 8px">Stan w miesiącu: ${monthWord}</p>${loanCards}` : '<p class="muted small">Brak kredytów.</p>'}
     <button class="btn block" data-action="add-account" data-group="loan">+ Dodaj kredyt</button>
 
     <div class="sec-head"><h2>Konta bieżące</h2><b class="num">${esc(formatMoney(sumPLN(current, (a) => bal[a.id])))}</b></div>
     <div class="list">${current.map((a) => `<button class="item" data-action="account-detail" data-id="${esc(a.id)}" data-lp="acc:${esc(a.id)}">
-      <span class="ico">${ico(accountIcon(a), a.image)}</span>
+      <span class="ico">${accIco(a)}</span>
       <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}</span></span>
       <span class="amt num ${bal[a.id] < 0 ? 'neg' : ''}">${esc(formatMoney(bal[a.id], a.currency))}</span></button>`).join('')}</div>
     <div class="actions"><button class="btn block" data-action="add-account" data-group="current">+ Dodaj konto</button></div>
@@ -712,7 +753,8 @@ function openAccountSheet(id, group) {
   group = a ? accountGroup(a) : (group || 'current');
   const used = id && state.data.transactions.some((t) => t.accountId === id || t.toAccountId === id);
   let subtype = a?.subtype || (a?.type === 'savings' ? 'deposit' : a ? 'other' : 'deposit');
-  const title = a ? 'Edytuj' : { savings: 'Nowe oszczędności / inwestycja', loan: 'Nowy kredyt', current: 'Nowe konto' }[group];
+  const title = a ? 'Edytuj' : { savings: 'Nowe oszczędności / inwestycja', loan: 'Nowy kredyt', current: 'Nowe konto', property: 'Nieruchomość / aktywo' }[group];
+  if (group === 'property' && !a) subtype = 'flat';
   const curSelect = `<label class="field"><span>Waluta</span><select id="a-cur" ${used ? 'disabled' : ''}>${CURRENCIES.map((c) => `<option ${(a?.currency || 'PLN') === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label>`;
   let body = '';
   if (group === 'savings') {
@@ -729,6 +771,23 @@ function openAccountSheet(id, group) {
       </div>
       <div class="grid2"><label class="field"><span id="a-open-label">${a ? 'Kwota początkowa' : 'Ile jest tam teraz'}</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
       <p class="small muted">Kolejne wpłaty i wypłaty dodajesz przyciskami na karcie.</p>`;
+  } else if (group === 'property') {
+    const loansList = state.data.accounts.filter((x) => x.type === 'loan' && !x.archived);
+    body = `<div class="field"><span>Rodzaj</span><div class="chips wrap" id="a-kind">${Object.entries(PROPERTY_KINDS).map(([k, v]) =>
+      `<button type="button" class="chip" data-kind="${k}" aria-pressed="${k === subtype}">${v.icon} ${esc(v.label)}</button>`).join('')}</div></div>
+      <label class="field"><span>Nazwa</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. Mieszkanie Kraków, Toyota"></label>
+      <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. 54 m², 3 pokoje"></label>
+      <label class="field"><span>${a ? 'Wartość początkowa' : 'Ile jest warte teraz'}</span><input id="a-open" class="amount-input" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>
+      ${a ? '<p class="small muted">Aktualną wartość zmieniasz przyciskiem „Aktualizuj wartość” na karcie — wtedy zostaje historia wycen.</p>' : ''}
+      <div class="grid2">
+        <label class="field"><span>Cena zakupu (opcj.)</span><input id="a-pprice" inputmode="decimal" value="${a?.purchasePrice ? esc(minorToInput(a.purchasePrice)) : ''}" placeholder="0,00"></label>
+        <label class="field"><span>Rok zakupu (opcj.)</span><input id="a-pyear" type="number" inputmode="numeric" min="1950" max="2100" value="${a?.purchaseYear || ''}"></label>
+      </div>
+      <label class="field"><span>Zmiana wartości w symulacji, % rocznie</span><input id="a-growth" inputmode="decimal" value="${esc(String(a?.growth ?? PROPERTY_KINDS[subtype]?.growth ?? 0).replace('.', ','))}"></label>
+      <p class="small muted">Np. mieszkanie +3%, samochód −10% (traci na wartości).</p>
+      <label class="field"><span>Powiązany kredyt (opcj.)</span><select id="a-loan"><option value="">— brak —</option>
+        ${loansList.map((l) => `<option value="${esc(l.id)}" ${a?.loanId === l.id ? 'selected' : ''}>${esc(l.name)}</option>`).join('')}</select></label>
+      ${curSelect}`;
   } else if (group === 'loan') {
     body = `<label class="field"><span>Nazwa kredytu</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. Hipoteka PKO, Kredyt na auto"></label>
       <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. do 2045, oprocentowanie zmienne"></label>
@@ -749,8 +808,9 @@ function openAccountSheet(id, group) {
     ${imagePickerHtml()}
     ${a ? `<label class="check"><input type="checkbox" id="a-arch" ${a.archived ? 'checked' : ''}> Zarchiwizuj (ukryj, historia zostaje)</label>` : ''}
     <div class="err" id="a-err" role="alert"></div>
-    <div class="actions"><button class="btn primary block" id="a-save">Zapisz</button></div>`);
-  const pick = mountImagePicker(a?.image);
+    <div class="actions ${a ? 'two' : ''}">${a ? `<button class="btn danger" data-action="del-account" data-id="${esc(a.id)}">Usuń</button>` : ''}<button class="btn primary block" id="a-save">Zapisz</button></div>`);
+  const pick = mountImagePicker(a?.image, { preview: () => badgeHtml(badgeFor($('#a-name')?.value || a?.name || '?', accountKindKey({ ...(a || {}), type: group === 'property' ? 'property' : group === 'loan' ? 'loan' : (a?.type || 'checking'), subtype }))) });
+  $('#a-name')?.addEventListener('input', () => { if (!pick.get()) $('#img-prev').innerHTML = badgeHtml(badgeFor($('#a-name').value || '?', accountKindKey({ type: group === 'property' ? 'property' : group === 'loan' ? 'loan' : (a?.type || 'checking'), subtype }))); });
   const paintMetal = () => {
     const box = $('#a-metal');
     if (!box) return;
@@ -763,9 +823,12 @@ function openAccountSheet(id, group) {
     kinds.onclick = (e) => {
       const b = e.target.closest('[data-kind]');
       if (!b) return;
+      const prevDefault = PROPERTY_KINDS[subtype]?.growth;
       subtype = b.dataset.kind;
       kinds.querySelectorAll('[data-kind]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
       paintMetal();
+      const g = $('#a-growth');
+      if (g && PROPERTY_KINDS[subtype] && (g.value === '' || Number(g.value.replace(',', '.')) === prevDefault)) g.value = String(PROPERTY_KINDS[subtype].growth).replace('.', ',');
     };
   }
   $('#a-save').onclick = async () => {
@@ -794,6 +857,21 @@ function openAccountSheet(id, group) {
         item.purity = Number($('#a-purity').value);
         item.spread = spread;
       }
+    } else if (group === 'property') {
+      const pprice = opt('#a-pprice');
+      const year = $('#a-pyear').value.trim();
+      const growth = Number(($('#a-growth').value || '0').replace(',', '.'));
+      if (!Number.isInteger(pprice) || pprice < 0) return err('Nieprawidłowa cena zakupu.');
+      if (year && !(Number(year) >= 1900 && Number(year) <= 2100)) return err('Nieprawidłowy rok zakupu.');
+      if (!Number.isFinite(growth) || growth < -50 || growth > 50) return err('Zmiana wartości: od −50 do 50% rocznie.');
+      if (opening < 0) return err('Wartość nie może być ujemna.');
+      item.type = 'property';
+      item.subtype = subtype;
+      item.description = $('#a-desc').value.trim();
+      item.purchasePrice = pprice || null;
+      item.purchaseYear = year ? Number(year) : null;
+      item.growth = growth;
+      item.loanId = $('#a-loan').value || null;
     } else if (group === 'loan') {
       const inst = opt('#a-inst');
       const orig = opt('#a-orig');
@@ -828,15 +906,17 @@ function openAccountDetail(id) {
   const txs = liveTx().filter((t) => t.accountId === id || t.toAccountId === id).sort(byDateDesc);
   const bookNow = balances([a], liveTx())[id];
   const isLoan = a.type === 'loan';
-  const inv = accountGroup(a) === 'savings' ? investmentResult(a, liveTx(), valOpts()) : null;
+  const isProp = accountGroup(a) === 'property';
+  const inv = accountGroup(a) === 'savings' || isProp ? investmentResult(a, liveTx(), valOpts()) : null;
   const bal = inv ? inv.value : bookNow;
   openSheet(a.name, `
     <p class="muted small" style="margin-top:0">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</p>
     <div class="stat-row" style="grid-template-columns:1fr 1fr">
       <div class="stat"><small>${isLoan ? 'Do spłaty' : inv ? 'Wartość' : 'Saldo'}</small><b class="num">${esc(formatMoney(isLoan ? -bal : bal, a.currency))}</b></div>
-      <div class="stat"><small>${isLoan ? 'Na start' : inv ? 'Wpłacono na start' : 'Saldo początkowe'}</small><b class="num">${esc(formatMoney(isLoan ? -a.openingBalance : a.openingBalance, a.currency))}</b></div>
+      <div class="stat"><small>${isLoan ? 'Na start' : isProp ? 'Wartość początkowa' : inv ? 'Wpłacono na start' : 'Saldo początkowe'}</small><b class="num">${esc(formatMoney(isLoan ? -a.openingBalance : a.openingBalance, a.currency))}</b></div>
     </div>
-    ${inv && (metalOf(a) || (a.valuations || []).length) ? `<p class="small" style="margin:10px 4px 0">Wpłacono <span class="num">${esc(formatMoney(inv.paidIn, a.currency))}</span> · ${inv.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${inv.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.gain, a.currency, { sign: true }))}${inv.gainPct != null ? ` (${esc(fmtPct(inv.gainPct * 100))})` : ''}</b></p>` : ''}
+    ${isProp && a.purchasePrice ? `<p class="small" style="margin:10px 4px 0">Kupione za <span class="num">${esc(formatMoney(a.purchasePrice, a.currency))}</span>${a.purchaseYear ? ` (${a.purchaseYear})` : ''} · zmiana <b class="num ${inv.value - a.purchasePrice >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.value - a.purchasePrice, a.currency, { sign: true }))}</b></p>` : ''}
+    ${inv && !isProp && (metalOf(a) || (a.valuations || []).length) ? `<p class="small" style="margin:10px 4px 0">Wpłacono <span class="num">${esc(formatMoney(inv.paidIn, a.currency))}</span> · ${inv.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${inv.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.gain, a.currency, { sign: true }))}${inv.gainPct != null ? ` (${esc(fmtPct(inv.gainPct * 100))})` : ''}</b></p>` : ''}
     ${metalOf(a) ? `<p class="small muted" style="margin:6px 4px 0">${metalLine(a)}</p>` : ''}
     ${inv ? valuationHistoryHtml(a) : ''}
     ${inv && !metalOf(a) ? `<div class="actions"><button class="btn primary block" data-action="valuate" data-id="${esc(id)}">📈 Aktualizuj wartość</button></div>` : ''}
@@ -1350,15 +1430,14 @@ function showAIData() {
     <pre class="json">${esc(JSON.stringify(currentAIContext(), null, 2))}</pre>`);
 }
 
-// ---------- Wybór obrazka (konta, plan, zakupy, kategorie) ----------
-function imagePickerHtml() {
-  return `<div class="field imgpick"><span>Obrazek (opcjonalnie — zastępuje ikonę)</span>
+// ---------- Wybór obrazka (konta, plan, zakupy, kategorie, profil) ----------
+function imagePickerHtml({ label = 'Obrazek (opcjonalnie — zastępuje ikonę)' } = {}) {
+  return `<div class="field imgpick"><span>${label}</span>
     <div class="imgpick-row"><div class="img-prev" id="img-prev"></div>
       <div class="img-btns">
+        <button type="button" class="btn" data-img="search">🔎 Szukaj obrazka</button>
         <button type="button" class="btn" data-img="file">📷 Z telefonu</button>
-        <button type="button" class="btn" data-img="logo">🏢 Logo firmy</button>
-        <button type="button" class="btn" data-img="url">🔗 Z linku</button>
-        <button type="button" class="btn danger" data-img="clear">Usuń obrazek</button>
+        <button type="button" class="btn" data-img="clear">✨ Generowana</button>
       </div></div>
     <div id="img-extra"></div>
     <p class="small muted" id="img-status"></p>
@@ -1366,52 +1445,57 @@ function imagePickerHtml() {
   </div>`;
 }
 
-function mountImagePicker(initial) {
+/** preview: (current) => HTML podglądu, gdy brak obrazka (np. generowana plakietka). */
+function mountImagePicker(initial, { preview = () => '<span class="muted small">brak</span>' } = {}) {
   let current = sanitizeImage(initial);
   const box = $('#sheet .imgpick');
   const status = (html, cls = 'muted') => { const el = $('#img-status'); el.className = 'small ' + cls; el.innerHTML = html; };
   const paint = () => {
-    $('#img-prev').innerHTML = current ? `<img src="${esc(current)}" alt="" referrerpolicy="no-referrer">` : '<span class="muted small">brak</span>';
+    $('#img-prev').innerHTML = current ? `<img src="${esc(current)}" alt="" referrerpolicy="no-referrer">` : preview();
     box.querySelector('[data-img="clear"]').hidden = !current;
   };
   paint();
-  if (current && !isLocalImage(current)) status('Ten obrazek jest wyświetlany bezpośrednio z serwera.');
-  const fetchInto = async (url, fit) => {
+  const fetchInto = async (url) => {
     status('Pobieram…');
     try {
-      current = await imageFromUrl(url, fit);
+      current = await imageFromUrl(url, 'cover');
       paint();
+      $('#img-extra').innerHTML = '';
       status('✓ Zapisano małą kopię w telefonie — obrazek nie będzie już pobierany z sieci.', 'pos');
     } catch (err) {
       if (err instanceof CorsBlockedError) {
-        status(`${esc(err.message)} Możesz wyświetlać go bezpośrednio z serwera <b>${esc(new URL(url).hostname)}</b> — wtedy przy każdym wyświetleniu telefon pobierze z niego ten obrazek (serwer nie dostaje żadnych Twoich danych finansowych). <button type="button" class="link" id="img-remote">Użyj z serwera</button> — albo zapisz obrazek w telefonie i wybierz „Z telefonu”.`, 'neg');
+        status(`${esc(err.message)} <button type="button" class="link" id="img-remote">Użyj bezpośrednio z serwera</button> (przy każdym wyświetleniu telefon pobierze go z ${esc(new URL(url).hostname)}; serwer nie dostaje Twoich danych).`, 'neg');
         $('#img-remote').onclick = () => { current = url; paint(); status('Obrazek będzie wyświetlany z serwera.'); };
-      } else {
-        status(esc(err.message), 'neg');
-      }
+      } else status(esc(err.message), 'neg');
+    }
+  };
+  const doSearch = async () => {
+    const q = $('#img-q').value.trim();
+    const res = $('#img-res');
+    status('Szukam…');
+    res.innerHTML = '';
+    try {
+      const list = await searchImages(q);
+      res.innerHTML = list.map((x, i) => `<button type="button" data-pick="${i}" title="${esc(x.title)}${x.creator ? ' — ' + esc(x.creator) : ''} (${esc(x.license)})"><img src="${esc(x.thumb)}" alt="${esc(x.title)}" loading="lazy" referrerpolicy="no-referrer"></button>`).join('');
+      status(`Znaleziono ${list.length}. Dotknij obrazka, żeby go wybrać. Źródła: Openverse i Wikimedia Commons (wolne licencje).`);
+      res.onclick = (e) => { const b = e.target.closest('[data-pick]'); if (b) fetchInto(list[Number(b.dataset.pick)].thumb); };
+    } catch (err) {
+      status(esc(err.message), 'neg');
     }
   };
   box.onclick = (e) => {
     const b = e.target.closest('[data-img]');
     if (!b) return;
     const kind = b.dataset.img;
-    const extra = $('#img-extra');
     if (kind === 'file') { $('#img-file').click(); return; }
-    if (kind === 'clear') { current = null; extra.innerHTML = ''; paint(); status(''); return; }
-    if (kind === 'logo') {
-      extra.innerHTML = `<div class="qa"><input id="img-domain" placeholder="adres strony, np. mbank.pl" autocomplete="off" autocapitalize="off" inputmode="url"><button type="button" class="btn primary" id="img-go">Pobierz</button></div>
-        <p class="small muted">Logo z DuckDuckGo. Wysyłana jest tylko nazwa strony — żadne Twoje dane.</p>`;
-      $('#img-go').onclick = () => {
-        const u = logoUrl($('#img-domain').value);
-        if (!u) { status('Wpisz adres strony, np. orlen.pl', 'neg'); return; }
-        fetchInto(u, 'contain');
-      };
-      $('#img-domain').focus();
-    } else if (kind === 'url') {
-      extra.innerHTML = `<div class="qa"><input id="img-url" placeholder="https://…" autocomplete="off" autocapitalize="off" inputmode="url"><button type="button" class="btn primary" id="img-go">Pobierz</button></div>
-        <p class="small muted">Dozwolone darmowe serwery: ${IMAGE_HOSTS.map(esc).join(', ')} oraz Twoja strona *.github.io. Inne adresy są blokowane dla ochrony danych.</p>`;
-      $('#img-go').onclick = () => fetchInto($('#img-url').value.trim(), 'cover');
-      $('#img-url').focus();
+    if (kind === 'clear') { current = null; $('#img-extra').innerHTML = ''; paint(); status('Ikona będzie generowana automatycznie.'); return; }
+    if (kind === 'search') {
+      $('#img-extra').innerHTML = `<div class="qa"><input id="img-q" placeholder="np. dom, auto, wakacje, house" autocomplete="off" enterkeyhint="search"><button type="button" class="btn primary" id="img-go">Szukaj</button></div>
+        <div class="img-results" id="img-res"></div>
+        <p class="small muted">Wysyłane jest tylko wpisane słowo. Po angielsku zwykle jest więcej wyników.</p>`;
+      $('#img-go').onclick = doSearch;
+      $('#img-q').onkeydown = (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); doSearch(); } };
+      $('#img-q').focus();
     }
   };
   $('#img-file').onchange = async (e) => {
@@ -1428,6 +1512,303 @@ function mountImagePicker(initial) {
     }
   };
   return { get: () => current };
+}
+
+// ---------- Ikony generowane ----------
+const genIconsOn = () => getPref('sf-genicons', '1') === '1';
+
+function badgeHtml(b, { mini = false } = {}) {
+  if (b.emoji) {
+    return mini ? `<span class="gen-mini" style="background:${b.bg}">${b.emoji}</span>`
+      : `<span class="gen gen-emoji" style="background:${b.bg}">${b.emoji}</span>`;
+  }
+  const text = esc(b.text);
+  const len = [...b.text].length;
+  return mini ? `<span class="gen-mini" style="background:${b.bg};color:${b.fg}">${text}</span>`
+    : `<span class="gen ${len >= 4 ? 'len4' : len === 3 ? 'len3' : ''}" style="background:${b.bg};color:${b.fg}">${text}</span>`;
+}
+
+function accountKindKey(a) {
+  if (a.type === 'property') return a.subtype || 'property_other';
+  if (a.type === 'loan') return 'loan';
+  if (a.subtype && a.subtype !== 'other') return a.subtype;
+  if (a.type === 'cash') return 'cash';
+  return null;
+}
+
+/** Ikona konta: własny obrazek → plakietka generowana (marka/rodzaj/inicjały) → emoji. */
+function accIco(a, opts = {}) {
+  if (sanitizeImage(a.image)) return ico('', a.image, opts);
+  if (genIconsOn()) return badgeHtml(badgeFor(a.name, accountKindKey(a)), opts);
+  return ico(accountIcon(a), null, opts);
+}
+
+/** Ikona pozycji planu: własny obrazek → plakietka marki (np. Orlen, PGE, Netflix) → emoji. */
+function billIco(b, fallback, opts = {}) {
+  if (sanitizeImage(b.image)) return ico('', b.image, opts);
+  const brand = genIconsOn() ? brandOf(b.name) : null;
+  if (brand) return badgeHtml({ text: brand.short || initials(b.name), bg: brand.bg, fg: brand.fg }, opts);
+  return ico(b.icon || fallback, null, opts);
+}
+
+// ---------- Profil ----------
+function profileAvatar(opts = {}) {
+  const p = state.profile || {};
+  if (sanitizeImage(p.avatar)) return `<img src="${esc(p.avatar)}" alt="">`;
+  if (p.name) return badgeHtml(badgeFor(p.name), opts);
+  return '<span>👤</span>';
+}
+
+function openProfileSheet() {
+  const p = state.profile || {};
+  openSheet('Profil', `
+    <label class="field"><span>Imię</span><input id="pr-name" maxlength="30" value="${esc(p.name || '')}" placeholder="np. Dawid" autocomplete="given-name"></label>
+    ${imagePickerHtml({ label: 'Avatar' })}
+    <p class="small muted">Imię i avatar są tylko w tym telefonie. Pojawiają się na ekranie Start, w animacji startowej i na ekranie blokady.</p>
+    <div class="actions"><button class="btn primary block" id="pr-save">Zapisz</button></div>`);
+  const pick = mountImagePicker(p.avatar, { preview: () => (($('#pr-name')?.value || p.name) ? badgeHtml(badgeFor($('#pr-name')?.value || p.name)) : '<span>👤</span>') });
+  $('#pr-name').oninput = () => { if (!pick.get()) $('#img-prev').innerHTML = $('#pr-name').value ? badgeHtml(badgeFor($('#pr-name').value)) : '<span>👤</span>'; };
+  $('#pr-save').onclick = async () => {
+    state.profile = { name: $('#pr-name').value.trim(), avatar: pick.get() || null };
+    await db.setSetting('profile', state.profile);
+    setPref('sf-name', state.profile.name);
+    closeSheet();
+    render();
+    toast('Zapisano profil');
+  };
+}
+
+// ---------- Animacja startowa ----------
+function runSplash() {
+  const el = $('#splash');
+  if (!el) return;
+  const off = getPref('sf-splash', '1') !== '1' || matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (off) { el.remove(); return; }
+  const name = getPref('sf-name', '');
+  $('#splash-hello').textContent = name ? `Cześć, ${name}!` : '';
+  const hide = () => { el.classList.add('hide'); setTimeout(() => el.remove(), 400); };
+  const left = Math.max(0, 2000 - performance.now());
+  const t = setTimeout(hide, left);
+  el.addEventListener('pointerdown', () => { clearTimeout(t); hide(); }, { once: true });
+}
+
+// ---------- Blokada (PIN / odcisk palca) ----------
+const lockCfg = () => { try { return JSON.parse(localStorage.getItem('sf-lock') || 'null'); } catch { return null; } };
+const saveLockCfg = (c) => { try { if (c) localStorage.setItem('sf-lock', JSON.stringify(c)); else localStorage.removeItem('sf-lock'); } catch { /* brak dostępu */ } };
+let lockState = { input: '', resolve: null, hiddenAt: null };
+
+function lockEnabled() { return !!lockCfg()?.pin; }
+
+function showLock() {
+  if (!lockEnabled()) return Promise.resolve();
+  if (lockState.resolve) return lockState.promise;
+  const cfg = lockCfg();
+  const el = $('#lock');
+  el.hidden = false;
+  $('#sheet').open && $('#sheet').close();
+  $('#lock-avatar').innerHTML = profileAvatar();
+  $('#lock-hello').textContent = state.profile?.name ? `Cześć, ${state.profile.name}` : 'Wpisz PIN';
+  $('#lock-bio').hidden = !cfg.bio;
+  lockState.input = '';
+  paintDots();
+  lockState.promise = new Promise((res) => { lockState.resolve = res; });
+  if (cfg.bio) setTimeout(tryBio, 300);
+  return lockState.promise;
+}
+
+function unlock() {
+  $('#lock').hidden = true;
+  const cfg = lockCfg();
+  if (cfg) saveLockCfg({ ...cfg, failed: 0, until: 0 });
+  const r = lockState.resolve;
+  lockState.resolve = null;
+  r && r();
+}
+
+function paintDots() {
+  const n = Math.max(4, lockState.input.length);
+  $('#lock-dots').innerHTML = Array.from({ length: n }, (_, i) => `<i class="${i < lockState.input.length ? 'on' : ''}"></i>`).join('');
+}
+
+async function tryBio() {
+  const cfg = lockCfg();
+  if (!cfg?.bio) return;
+  try {
+    if (await verifyBiometric(cfg.bio)) unlock();
+  } catch { $('#lock-msg').textContent = 'Użyj PIN-u albo dotknij ☝️, żeby spróbować ponownie.'; }
+}
+
+async function pinKey(k) {
+  const cfg = lockCfg();
+  const wait = Math.ceil(((cfg.until || 0) - Date.now()) / 1000);
+  if (wait > 0) { $('#lock-msg').textContent = `Za dużo prób. Spróbuj za ${wait} s.`; return; }
+  if (k === 'bio') { tryBio(); return; }
+  if (k === 'del') lockState.input = lockState.input.slice(0, -1);
+  else if (lockState.input.length < 8) lockState.input += k;
+  $('#lock-msg').textContent = '';
+  paintDots();
+  if (lockState.input.length >= (cfg.pinLength || 4)) {
+    const ok = await verifyPin(lockState.input, cfg.pin);
+    if (ok) { unlock(); return; }
+    if (lockState.input.length >= (cfg.pinLength || 4)) {
+      const failed = (cfg.failed || 0) + 1;
+      const secs = lockoutSeconds(failed);
+      saveLockCfg({ ...cfg, failed, until: secs ? Date.now() + secs * 1000 : 0 });
+      lockState.input = '';
+      paintDots();
+      $('#lock-msg').textContent = secs ? `Błędny PIN. Następna próba za ${secs} s.` : 'Błędny PIN';
+      if (navigator.vibrate) try { navigator.vibrate([60, 40, 60]); } catch { /* brak */ }
+    }
+  }
+}
+
+function setupLock() {
+  $('#lock-pad').addEventListener('click', (e) => { const b = e.target.closest('[data-k]'); if (b) pinKey(b.dataset.k); });
+  document.addEventListener('keydown', (e) => {
+    if ($('#lock').hidden) return;
+    if (/^\d$/.test(e.key)) pinKey(e.key); else if (e.key === 'Backspace') pinKey('del');
+  });
+  $('#lock-forgot').onclick = async () => {
+    $('#lock').hidden = true;
+    const ok = await confirmSheet('Nie pamiętasz PIN-u?',
+      'PIN-u nie da się odzyskać — jest zapisany tylko jako zaszyfrowany skrót. Możesz usunąć wszystkie dane z tego telefonu (i potem przywrócić je z kopii zapasowej).',
+      { confirmLabel: 'Usuń dane i blokadę', danger: true, typeToConfirm: 'USUŃ' });
+    if (ok) {
+      await db.wipeAll();
+      await db.ensureDefaults();
+      saveLockCfg(null);
+      unlock();
+      await reload();
+      toast('Usunięto dane i blokadę. Możesz przywrócić kopię w Ustawieniach.');
+    } else {
+      $('#lock').hidden = false;
+    }
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!lockEnabled()) return;
+    const cfg = lockCfg();
+    if (document.hidden) {
+      lockState.hiddenAt = Date.now();
+      if (!cfg.timeout) showLock(); // natychmiast: zasłoń też podgląd w ostatnich aplikacjach
+    } else if (lockState.hiddenAt && Date.now() - lockState.hiddenAt >= (cfg.timeout || 0) * 60000) {
+      showLock();
+    }
+  });
+}
+
+async function openPinSetup({ change = false } = {}) {
+  const cfg = lockCfg();
+  openSheet(change ? 'Zmień PIN' : 'Ustaw PIN', `
+    ${change ? '<label class="field"><span>Obecny PIN</span><input id="pin-old" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label>' : ''}
+    <label class="field"><span>Nowy PIN (4–8 cyfr)</span><input id="pin-1" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label>
+    <label class="field"><span>Powtórz PIN</span><input id="pin-2" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label>
+    <div class="err" id="pin-err" role="alert"></div>
+    <p class="small muted">PIN jest zapisany tylko jako zaszyfrowany skrót w tym telefonie. Nie da się go odzyskać — w razie zapomnienia trzeba usunąć dane i przywrócić kopię zapasową.</p>
+    <div class="actions"><button class="btn primary block" id="pin-save">Zapisz PIN</button></div>`);
+  focusLater(change ? '#pin-old' : '#pin-1');
+  $('#pin-save').onclick = async () => {
+    const err = (m) => { $('#pin-err').textContent = m; };
+    if (change && !(await verifyPin($('#pin-old').value, cfg?.pin))) return err('Obecny PIN jest błędny.');
+    const a = $('#pin-1').value; const b = $('#pin-2').value;
+    if (!PIN_RE.test(a)) return err('PIN musi mieć od 4 do 8 cyfr.');
+    if (a !== b) return err('PIN-y się różnią.');
+    const pin = await hashPin(a);
+    saveLockCfg({ ...(cfg || { timeout: 1 }), pin, pinLength: a.length, failed: 0, until: 0 });
+    closeSheet();
+    render();
+    toast(change ? 'Zmieniono PIN' : 'Blokada włączona');
+  };
+}
+
+async function disableLock() {
+  const cfg = lockCfg();
+  openSheet('Wyłącz blokadę', `<label class="field"><span>Wpisz PIN</span><input id="pin-off" type="password" inputmode="numeric" maxlength="8" autocomplete="off"></label>
+    <div class="err" id="pin-err" role="alert"></div>
+    <div class="actions"><button class="btn danger block" id="pin-off-go">Wyłącz blokadę</button></div>`);
+  focusLater('#pin-off');
+  $('#pin-off-go').onclick = async () => {
+    if (!(await verifyPin($('#pin-off').value, cfg?.pin))) { $('#pin-err').textContent = 'Błędny PIN.'; return; }
+    saveLockCfg(null);
+    closeSheet();
+    render();
+    toast('Blokada wyłączona');
+  };
+}
+
+async function toggleBio(on) {
+  const cfg = lockCfg();
+  if (!cfg) return;
+  if (!on) { saveLockCfg({ ...cfg, bio: null }); render(); return; }
+  try {
+    const id = await registerBiometric(state.profile?.name || 'Smart Finance');
+    saveLockCfg({ ...cfg, bio: id });
+    toast('Dodano odblokowanie odciskiem palca');
+  } catch (e) {
+    toast('Nie udało się: ' + (e?.message || 'anulowano'));
+  }
+  render();
+}
+
+// ---------- Dyktowanie ----------
+async function dictateInto(input) {
+  if (!speechSupported()) { toast('Ta przeglądarka nie obsługuje dyktowania (użyj Chrome lub Edge)'); return; }
+  if (getPref('sf-voice-ok', '') !== '1') {
+    // eslint-disable-next-line no-alert
+    const ok = window.confirm('Dyktowanie głosem: rozpoznawanie mowy wykonuje przeglądarka — w Chrome i Edge nagranie jest przetwarzane przez serwery Google lub Microsoft. Do aplikacji trafia tylko rozpoznany tekst. Włączyć?');
+    if (!ok) return;
+    setPref('sf-voice-ok', '1');
+  }
+  const btn = document.querySelector('.mic');
+  btn?.classList.add('on');
+  input.placeholder = 'Słucham… powiedz np. „paliwo 250 złotych”';
+  try {
+    const text = await listen({ onPartial: (t) => { input.value = t; } });
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn?.classList.remove('on');
+    input.placeholder = 'Szybko: „Paliwo 250 zł dzisiaj”';
+  }
+}
+
+// ---------- Usuwanie konta ----------
+async function deleteAccountFlow(id) {
+  const a = accById()[id];
+  if (!a) return;
+  const txs = state.data.transactions.filter((t) => !t.deletedAt && (t.accountId === id || t.toAccountId === id));
+  const value = accountValue(a, liveTx(), valOpts());
+  const ok = await confirmSheet(`Usunąć „${a.name}”?`,
+    `Konto${txs.length ? ` i jego <b>${txs.length}</b> transakcji` : ''} trafi do Kosza (Ustawienia → Kosz) — możesz je stamtąd przywrócić.<br><br>
+    Majątek netto zmieni się o <b class="num">${esc(formatMoney(-value, a.currency, { sign: true }))}</b>.${txs.some((t) => t.type === 'transfer') ? '<br><br>Przelewy z innymi kontami też trafią do Kosza, więc salda tamtych kont się zmienią.' : ''}`,
+    { confirmLabel: 'Usuń konto', danger: true });
+  if (!ok) return;
+  const now = new Date().toISOString();
+  const txIds = new Set(txs.map((t) => t.id));
+  await db.put('accounts', { ...a, deletedAt: now });
+  if (txs.length) await db.put('transactions', ...txs.map((t) => ({ ...t, deletedAt: now, deletedWithAccount: id })));
+  const bills = state.data.bills.filter((b) => b.accountId === id || (b.txId && txIds.has(b.txId)));
+  if (bills.length) await db.put('bills', ...bills.map((b) => ({ ...b, accountId: b.accountId === id ? null : b.accountId, ...(b.txId && txIds.has(b.txId) ? { txId: null, txSkipped: true } : {}) })));
+  const buys = state.data.purchases.filter((p) => p.accountId === id);
+  if (buys.length) await db.put('purchases', ...buys.map((p) => ({ ...p, accountId: null, savedManual: Math.max(0, value) })));
+  const linked = state.data.accounts.filter((x) => x.loanId === id);
+  if (linked.length) await db.put('accounts', ...linked.map((x) => ({ ...x, loanId: null })));
+  if (state.prefs.defaultAccount === id) { state.prefs.defaultAccount = ''; await db.setSetting('defaultAccount', ''); }
+  await reload();
+  toast(`Usunięto: ${a.name}`, { label: 'Cofnij', run: () => restoreAccount(id) });
+}
+
+async function restoreAccount(id) {
+  const all = await db.getAll('accounts');
+  const a = all.find((x) => x.id === id);
+  if (!a) return;
+  const { deletedAt, ...live } = a;
+  await db.put('accounts', live);
+  const txs = state.data.transactions.filter((t) => t.deletedWithAccount === id);
+  if (txs.length) await db.put('transactions', ...txs.map(({ deletedAt: d, deletedWithAccount, ...t }) => t));
+  await reload();
+  toast(`Przywrócono: ${a.name}`);
 }
 
 // ---------- Wyceny, metale, wykresy ----------
@@ -1538,7 +1919,7 @@ function openValuationSheet(id) {
   };
   const paint = () => {
     const b = base();
-    $('#va-base').innerHTML = `Wartość na ${esc(formatDatePL($('#va-date').value || today))}: <b class="num">${esc(formatMoney(b, a.currency))}</b> · wpłacono <span class="num">${esc(formatMoney(bookBalance(a, txs, $('#va-date').value || today), a.currency))}</span>`;
+    $('#va-base').innerHTML = `Wartość na ${esc(formatDatePL($('#va-date').value || today))}: <b class="num">${esc(formatMoney(b, a.currency))}</b>${a.type === 'property' ? '' : ` · wpłacono <span class="num">${esc(formatMoney(bookBalance(a, txs, $('#va-date').value || today), a.currency))}</span>`}`;
     const r = parse();
     $('#va-preview').innerHTML = r ? `<b class="num">${esc(formatMoney(b, a.currency))}</b> → <b class="num">${esc(formatMoney(r.value, a.currency))}</b><br>
       <span class="${r.diff >= 0 ? 'pos' : 'neg'} num">${esc(formatMoney(r.diff, a.currency, { sign: true }))}${r.pct != null ? ` (${esc(fmtPct(r.pct))})` : ''}</span>`
@@ -1607,6 +1988,7 @@ function simStart() {
   const w = valuedNetWorth(state.data.accounts, txs, valOpts());
   const start = { cash: 0, safe: 0, market: 0, retire: 0, metal: 0 };
   const loans = [];
+  const properties = [];
   const s = simSettings();
   let estimated = false;
   for (const a of state.data.accounts) {
@@ -1620,17 +2002,19 @@ function simStart() {
         if (!installment) { installment = loanInstallment(-v, rate, 120); estimated = true; }
         loans.push({ name: a.name, balance: -v, rate, installment, rateAssumed: a.loanRate == null });
       }
+    } else if (b === 'property') {
+      properties.push({ name: a.name, value: v, growth: a.growth ?? PROPERTY_KINDS[a.subtype]?.growth ?? 0 });
     } else start[b] += v;
   }
   const avg = averages(txs, addMonths(monthKey(todayISO()), -1), 3);
-  return { start, loans, avg, net: w.net, estimated };
+  return { start, loans, properties, avg, net: w.net, estimated };
 }
 
 function runSim(s, st, delta = 0) {
   const monthly = s.monthly != null ? Math.round(s.monthly * 100) : Math.max(0, st.avg.net);
   const rates = { safe: s.rSafe + delta, market: s.rMarket + delta, retire: s.rRetire + delta, metal: s.rMetal + delta };
   return simulate({
-    start: st.start, loans: st.loans, monthly, years: s.years, rates, inflation: s.inflation, belka: s.belka,
+    start: st.start, loans: st.loans, properties: st.properties, monthly, years: s.years, rates, inflation: s.inflation, belka: s.belka,
     overpay: Math.round((s.overpay || 0) * 100), alloc: { safe: s.allocSafe, market: s.allocMarket, retire: s.allocRetire },
     investLoan: s.il.on ? { amount: Math.round(s.il.amount * 100), rate: s.il.rate, months: s.il.months, target: s.il.target } : null,
   });
@@ -1649,6 +2033,7 @@ function viewSim() {
         <li><div><span>ETF, fundusze, akcje, krypto</span><span class="num">${z(st.start.market)}</span></div></li>
         <li><div><span>IKE, IKZE, PPK</span><span class="num">${z(st.start.retire)}</span></div></li>
         <li><div><span>Złoto i srebro</span><span class="num">${z(st.start.metal)}</span></div></li>
+        ${st.properties.map((p) => `<li><div><span>${esc(p.name)} <small class="muted">(${p.growth >= 0 ? '+' : ''}${String(p.growth).replace('.', ',')}%/rok)</small></span><span class="num">${z(p.value)}</span></div></li>`).join('')}
         ${st.loans.map((l) => `<li><div><span>Kredyt: ${esc(l.name)}${l.rateAssumed ? ' <small class="muted">(oprocentowanie założone)</small>' : ''}</span><span class="num neg">−${z(l.balance)}</span></div></li>`).join('')}
         <li><div><span>Średnia nadwyżka (${st.avg.months} mies.)</span><span class="num">${st.avg.months ? z(st.avg.net) : 'brak danych'}</span></div></li>
       </ul>
@@ -1711,17 +2096,22 @@ function simResultsHtml(s = simSettings(), st = simStart()) {
   return `<section class="card"><h2>📈 Szacunek za ${s.years} lat</h2>
       <div class="big-result"><b class="num">${z(base.final.net)}</b><span>majątek netto w ${nowYear + s.years} r.</span></div>
       <p class="small">W dzisiejszych pieniądzach (po inflacji ${String(s.inflation).replace('.', ',')}%): <b class="num">${z(base.final.netReal)}</b></p>
+      ${base.properties.length ? `<p class="small">W tym nieruchomości i inne aktywa: <b class="num">${z(base.final.property)}</b> · <b>majątek płynny</b> (bez nich): <b class="num">${z(base.final.liquid)}</b></p>` : ''}
       <div class="chart">${lineChart([
         { values: base.series.map((p) => p.net), color: 'var(--accent)' },
         { values: base.series.map((p) => p.netReal), color: 'var(--muted)', dash: true },
         { values: base.series.map((p) => -p.debt), color: 'var(--expense)' },
+        ...(base.properties.length ? [{ values: base.series.map((p) => p.liquid), color: 'var(--transfer)' }] : []),
       ], base.series.map((p) => String(nowYear + p.month / 12 | 0)))}
-        <div class="legend"><span><i style="background:var(--accent)"></i>Netto</span><span><i style="background:var(--muted)"></i>Po inflacji</span><span><i style="background:var(--expense)"></i>Długi</span></div></div>
+        <div class="legend"><span><i style="background:var(--accent)"></i>Netto</span><span><i style="background:var(--muted)"></i>Po inflacji</span><span><i style="background:var(--expense)"></i>Długi</span>${base.properties.length ? '<span><i style="background:var(--transfer)"></i>Płynny</span>' : ''}</div></div>
       ${sum !== 100 ? `<p class="small neg">Podział nadwyżki sumuje się do ${sum}% — liczę proporcjonalnie.</p>` : ''}
     </section>
     <section class="card"><h2>Rok po roku</h2><ul class="menu kv">
       ${pick.map((y) => { const p = base.series.find((q) => q.month === y * 12) || base.final; return `<li><div><span>${nowYear + y} (za ${y} ${y === 1 ? 'rok' : y < 5 ? 'lata' : 'lat'})</span><span><b class="num">${z(p.net)}</b> <small class="muted num">/ ${z(p.netReal)}</small></span></div></li>`; }).join('')}
     </ul><p class="small muted">Druga kwota: wartość po inflacji.</p></section>
+    ${base.properties.length ? `<section class="card"><h2>Nieruchomości i inne aktywa za ${s.years} lat</h2><ul class="menu kv">
+      ${base.properties.map((p, i) => `<li><div><span>${esc(p.name)} <small class="muted">(${st.properties[i].growth >= 0 ? '+' : ''}${String(st.properties[i].growth).replace('.', ',')}%/rok)</small></span><span><span class="num muted">${z(p.start)}</span> → <b class="num">${z(p.end)}</b></span></div></li>`).join('')}
+    </ul><p class="small muted">Zmianę % ustawisz w Majątek → aktywo → Edytuj.</p></section>` : ''}
     <section class="card"><h2>Kamienie milowe</h2><ul class="menu kv">
       ${base.payoffs.map((l) => `<li><div><span>${esc(l.name)}</span><span>${l.month != null ? `spłacony: <b>${esc(whenYm(l.month))}</b> <small class="muted">(za ${esc(monthsLabel(l.month))})</small>` : `<span class="neg">do spłaty po ${s.years} latach: ${z(l.left)}</span>`}</span></div></li>`).join('')}
       ${base.milestones.map((m) => `<li><div><span>Majątek netto ${z(m.amount)}</span><span><b>${esc(whenYm(m.month))}</b></span></div></li>`).join('')}
@@ -1782,7 +2172,22 @@ function viewSettings() {
     `<button type="button" data-action="${action}" data-${key}="${id}" aria-pressed="${cur === id}">${esc(label)}</button>`).join('')}</div>`;
   const shown = visibleCards(state.layout).length;
   const accOpts = activeAccounts().filter((a) => accountGroup(a) === 'current');
-  return `<section class="card"><h2>Wygląd</h2>
+  const lk = lockCfg();
+  return `<section class="card"><h2>Profil</h2>
+      <button class="hello link" data-action="profile" style="color:inherit;margin:0"><span class="av">${profileAvatar()}</span>${state.profile?.name ? esc(state.profile.name) : 'Dodaj imię i avatar'} <span class="small muted" style="margin-left:auto">Edytuj ›</span></button>
+    </section>
+    <section class="card"><h2>Logowanie (blokada aplikacji)</h2>
+      <div class="row-set"><span>Wymagaj PIN-u przy otwarciu<span class="sub">Chroni przed kimś, kto weźmie odblokowany telefon</span></span>${sw('set-lock', !!lk?.pin, 'lock-toggle')}</div>
+      ${lk?.pin ? `
+        ${state.bioAvailable ? `<div class="row-set"><span>Odblokowanie odciskiem palca<span class="sub">Lub rozpoznaniem twarzy — zależnie od telefonu</span></span>${sw('set-bio', !!lk.bio, 'bio-toggle')}</div>` : ''}
+        <div class="row-set"><span>Blokuj po wyjściu z aplikacji</span><select id="set-locktime">
+          ${[[0, 'od razu'], [1, 'po 1 minucie'], [5, 'po 5 minutach'], [15, 'po 15 minutach']].map(([v, l]) => `<option value="${v}" ${(lk.timeout ?? 1) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+        <ul class="menu"><li><button data-action="lock-change"><span>Zmień PIN</span>›</button></li></ul>` : ''}
+      <p class="small muted">Blokada działa w tym telefonie. Dane w pamięci przeglądarki nie są przez nią dodatkowo szyfrowane — dlatego używaj też blokady ekranu telefonu.</p>
+    </section>
+    <section class="card"><h2>Wygląd</h2>
+      <div class="row-set" style="border-top:0;padding-top:0"><span>Animacja przy uruchomieniu<span class="sub">2 sekundy, dotknięcie pomija</span></span>${sw('set-splash', getPref('sf-splash', '1') === '1', 'splash-toggle')}</div>
+      <div class="row-set"><span>Ikony generowane<span class="sub">Kolory banków i firm, inicjały, ikony rodzaju — bez internetu</span></span>${sw('set-genicons', genIconsOn(), 'genicons-toggle')}</div>
       <div class="field" style="margin-top:0"><span>Motyw</span>${seg('theme', 'theme', theme, { system: 'Systemowy', light: 'Jasny', dark: 'Ciemny' })}</div>
       <div class="field"><span>Kolor aplikacji</span><div class="swatches">${Object.entries(ACCENTS).map(([id, a]) =>
         `<button type="button" class="swatch" data-action="accent" data-accent="${id}" aria-pressed="${accent === id}"><i style="background:${a.light[0]}"></i>${esc(a.label)}</button>`).join('')}</div></div>
@@ -1961,12 +2366,13 @@ function openContextMenu(spec) {
     title = a.name;
     head = esc(accountKindLabel(a));
     if (g === 'savings') items.push(item('move', '➕', metalOf(a) ? 'Kupno' : 'Wpłata', { close: false, extra: 'data-mode="in"' }), item('move', '➖', metalOf(a) ? 'Sprzedaż' : 'Wypłata', { close: false, extra: 'data-mode="out"' }));
-    if (g === 'savings' && !metalOf(a)) items.push(item('valuate', '📈', 'Aktualizuj wartość', { close: false }));
+    if ((g === 'savings' && !metalOf(a)) || g === 'property') items.push(item('valuate', '📈', 'Aktualizuj wartość', { close: false }));
     if (g === 'loan') items.push(item('move', '💸', 'Dodaj spłatę', { close: false, extra: 'data-mode="pay"' }));
     items.push(
       item('account-detail', '📜', 'Historia', { close: false }),
       item('edit-account', '✏️', 'Edytuj', { close: false }),
-      item('archive-acc', '📦', 'Zarchiwizuj (ukryj)', { danger: true }),
+      item('archive-acc', '📦', 'Zarchiwizuj (ukryj)'),
+      item('del-account', '🗑️', 'Usuń konto', { danger: true }),
     );
   } else if (kind === 'card') {
     const pos = visibleCards(state.layout).indexOf(id);
@@ -2079,11 +2485,16 @@ function openCategorySheet(id, kind) {
 
 function openTrashSheet() {
   const cats = catById();
-  const del = state.data.transactions.filter((t) => t.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
-  openSheet('Kosz', del.length ? `
-    <div class="list">${del.map((t) => `<div class="item"><span class="ico">${txIco(t, cats)}</span>
+  const del = state.data.transactions.filter((t) => t.deletedAt && !t.deletedWithAccount).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
+  const accs = state.deletedAccounts;
+  const withAcc = (id) => state.data.transactions.filter((t) => t.deletedWithAccount === id).length;
+  openSheet('Kosz', del.length || accs.length ? `
+    ${accs.length ? `<h3 class="copy-h">Usunięte konta</h3><div class="list">${accs.map((a) => `<div class="item"><span class="ico">${accIco(a)}</span>
+      <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))} · ${withAcc(a.id)} transakcji · usunięte ${esc(formatDatePL(a.deletedAt.slice(0, 10)))}</span></span>
+      <button class="link" data-action="restore-account" data-id="${esc(a.id)}">Przywróć</button></div>`).join('')}</div>` : ''}
+    ${del.length ? `<h3 class="copy-h">Transakcje</h3><div class="list">${del.map((t) => `<div class="item"><span class="ico">${txIco(t, cats)}</span>
       <span class="mid"><span class="t1">${esc(t.description || catLabel(t.categoryId, cats))}</span><span class="t2">${esc(formatDatePL(t.date))} · ${esc(formatMoney(t.amount, t.currency))}</span></span>
-      <button class="link" data-action="restore-tx" data-id="${esc(t.id)}">Przywróć</button></div>`).join('')}</div>
+      <button class="link" data-action="restore-tx" data-id="${esc(t.id)}">Przywróć</button></div>`).join('')}</div>` : ''}
     <div class="actions"><button class="btn danger block" data-action="empty-trash">Opróżnij kosz (nieodwracalne)</button></div>`
     : '<p class="empty">Kosz jest pusty.</p>');
 }
@@ -2112,7 +2523,7 @@ async function openTxSheet(id, opts = {}) {
     || accounts.find((a) => a.id === lastAccount)
     || accounts.find((a) => a.type === 'checking') || accounts[0]).id;
   const f = {
-    type: existing?.type || 'expense',
+    type: existing?.type || opts.type || 'expense',
     amount: existing ? minorToInput(existing.amount) : '',
     date: existing?.date || todayISO(),
     categoryId: existing?.categoryId || null,
@@ -2136,7 +2547,7 @@ async function openTxSheet(id, opts = {}) {
       <button type="button" data-type="income">Przychód</button>
       <button type="button" data-type="transfer">Transfer</button>
     </div>
-    ${existing ? '' : `<div class="quick"><input id="t-quick" placeholder="Szybko: „Paliwo 250 zł dzisiaj”" autocomplete="off" enterkeyhint="done"></div>
+    ${existing ? '' : `<div class="quick"><input id="t-quick" placeholder="Szybko: „Paliwo 250 zł dzisiaj”" autocomplete="off" enterkeyhint="done">${speechSupported() ? '<button type="button" class="mic" id="t-mic" aria-label="Dyktuj głosem">🎤</button>' : ''}</div>
     <div class="quick-hint" id="t-hint"></div>`}
     ${recent.length ? `<div class="chips" style="margin-top:6px">${recent.map((t, i) => `<button type="button" class="chip" data-recent="${i}">${catIco(t.categoryId, catById(), { mini: true })} ${esc(t.description)}</button>`).join('')}</div>` : ''}
     <label class="field"><span>Kwota</span><input id="t-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(f.amount)}" autocomplete="off"></label>
@@ -2242,6 +2653,9 @@ async function openTxSheet(id, opts = {}) {
     };
     quick.oninput = apply;
     if (opts.quick) { quick.value = opts.quick; apply(); }
+    const mic = $('#t-mic');
+    if (mic) mic.onclick = () => dictateInto(quick);
+    if (opts.voice && mic) setTimeout(() => dictateInto(quick), 300);
     quick.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); apply(); $('#t-save').click(); } };
     focusLater('#t-quick');
   }
@@ -2346,7 +2760,9 @@ async function confirmSheet(title, message, { confirmLabel = 'Potwierdź', dange
     if (typeToConfirm) $('#cf-input').oninput = (e) => { $('#cf-yes').disabled = e.target.value.trim().toUpperCase() !== typeToConfirm; };
     $('#cf-no').onclick = () => { closeSheet(); resolve(false); };
     $('#cf-yes').onclick = () => { closeSheet(); resolve(true); };
-    $('#sheet').addEventListener('close', () => resolve(false), { once: true });
+    // spóźnione zdarzenie „close” od poprzedniego okienka nie może anulować tego potwierdzenia
+    const onClose = () => { if (!$('#sheet').open) { $('#sheet').removeEventListener('close', onClose); resolve(false); } };
+    $('#sheet').addEventListener('close', onClose);
   });
 }
 
@@ -2403,6 +2819,17 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'del-account': if ($('#sheet').open) closeSheet(); deleteAccountFlow(el.dataset.id); break;
+    case 'restore-account': await restoreAccount(el.dataset.id); openTrashSheet(); break;
+    case 'profile': openProfileSheet(); break;
+    case 'genicons-toggle': setPref('sf-genicons', el.checked ? '1' : '0'); render(); break;
+    case 'splash-toggle': setPref('sf-splash', el.checked ? '1' : '0'); break;
+    case 'lock-toggle':
+      if (el.checked) { el.checked = false; openPinSetup(); } else { el.checked = true; disableLock(); }
+      break;
+    case 'lock-change': openPinSetup({ change: true }); break;
+    case 'bio-toggle': toggleBio(el.checked); break;
+    case 'dash-mic': { const inp = $('#dash-quick'); if (inp) { await dictateInto(inp); if (inp.value.trim()) openTxSheet(null, { quick: inp.value.trim() }); } break; }
     case 'valuate': openValuationSheet(el.dataset.id); break;
     case 'del-valuation': {
       const acc = accById()[el.dataset.id];
@@ -2549,8 +2976,10 @@ async function onAction(e) {
     }
     case 'empty-trash': {
       const n = state.data.transactions.filter((t) => t.deletedAt).length;
-      if (await confirmSheet('Opróżnić kosz?', `Trwale usunąć ${n} transakcji? Tego nie da się cofnąć.`, { confirmLabel: 'Usuń trwale', danger: true })) {
+      const na = state.deletedAccounts.length;
+      if (await confirmSheet('Opróżnić kosz?', `Trwale usunąć ${n} transakcji${na ? ` i ${na} kont` : ''}? Tego nie da się cofnąć.`, { confirmLabel: 'Usuń trwale', danger: true })) {
         for (const t of state.data.transactions.filter((x) => x.deletedAt)) await db.remove('transactions', t.id);
+        for (const a of state.deletedAccounts) await db.remove('accounts', a.id);
         await reload();
         toast('Kosz opróżniony');
       }
@@ -2595,11 +3024,22 @@ function showError(err) {
 
 async function init() {
   applyTheme();
+  runSplash();
+  setupLock();
+  const params = new URLSearchParams(location.search);
+  const shortcut = params.get('add');
+  if (shortcut) history.replaceState(null, '', location.pathname + location.hash);
   window.addEventListener('unhandledrejection', (e) => showError(e.reason));
   window.addEventListener('error', (e) => showError(e.error || e.message));
   document.addEventListener('click', onAction);
   setupLongPress();
   document.addEventListener('change', async (e) => {
+    if (e.target.id === 'set-locktime') {
+      const cfg = lockCfg();
+      if (cfg) saveLockCfg({ ...cfg, timeout: Number(e.target.value) });
+      toast('Zapisano');
+      return;
+    }
     if (e.target.id === 'set-defacc') {
       state.prefs.defaultAccount = e.target.value;
       await db.setSetting('defaultAccount', e.target.value);
@@ -2628,15 +3068,22 @@ async function init() {
     state.layout = normalizeLayout(await db.getSetting('dashLayout', null));
     state.prices = await db.getSetting('metalPrices', null);
     state.simSettings = await db.getSetting('simSettings', null);
+    state.profile = await db.getSetting('profile', null);
+    if (state.profile?.name) setPref('sf-name', state.profile.name);
     state.prefs.defaultAccount = await db.getSetting('defaultAccount', '') || '';
-    state.data = await db.loadAll();
+    await loadData();
   } catch (err) {
     $('#view').innerHTML = `<div class="note warn">Nie można otworzyć bazy danych: ${esc(err.message)}<br>Sprawdź, czy przeglądarka nie jest w trybie prywatnym.</div>`;
     return;
   }
   state.persisted = await db.requestPersistence();
+  const locked = lockEnabled() ? showLock() : Promise.resolve();
   route();
+  biometricAvailable().then((v) => { state.bioAvailable = v; if (state.view === 'settings') render(); });
   if (hasMetals() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
+  await locked;
+  if (shortcut === 'expense' || shortcut === 'income') openTxSheet(null, { type: shortcut });
+  else if (shortcut === 'voice') openTxSheet(null, { voice: true });
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline niedostępny — aplikacja działa dalej */ });
   }

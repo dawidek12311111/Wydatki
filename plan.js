@@ -110,5 +110,5 @@ export function yearTiles(transactions, bills, year) {
 /** Odhaczone pozycje bez (żywej) powiązanej transakcji — np. odhaczone w starszej wersji aplikacji. */
 export function paidWithoutTx(bills, transactions, ym) {
   const live = new Set(transactions.filter(isLive).map((t) => t.id));
-  return bills.filter((b) => b.month === ym && b.paid && !(b.txId && live.has(b.txId)));
+  return bills.filter((b) => b.month === ym && b.paid && !b.txSkipped && !(b.txId && live.has(b.txId)));
 }

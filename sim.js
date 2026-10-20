@@ -22,6 +22,7 @@ export const DEFAULT_SIM = {
 /** Do jakiego „koszyka” trafia konto w symulacji. */
 export function bucketOf(a) {
   if (a.type === 'loan') return 'debt';
+  if (a.type === 'property') return 'property';
   if (a.subtype === 'gold' || a.subtype === 'silver') return 'metal';
   if (['ike', 'ikze', 'ppk'].includes(a.subtype)) return 'retire';
   if (a.type === 'savings' || a.subtype === 'deposit' || a.subtype === 'bonds') return 'safe';
@@ -37,8 +38,11 @@ const TAXED = { safe: true, market: true, retire: false, metal: false, cash: fal
  * loans: [{ name, balance (grosze, dodatnie), rate (%), installment (grosze) }]
  * monthly: miesięczna nadwyżka przed ratami (grosze) — raty i nadpłaty są z niej opłacane
  */
-export function simulate({ start, loans = [], monthly = 0, years = 10, rates, inflation = 0, belka = true, overpay = 0, alloc, investLoan = null }) {
+export function simulate({ start, loans = [], monthly = 0, years = 10, rates, inflation = 0, belka = true, overpay = 0, alloc, investLoan = null, properties = [] }) {
   const b = { cash: 0, safe: 0, market: 0, retire: 0, metal: 0, ...start };
+  // nieruchomości i inne aktywa: każda z własnym wzrostem/spadkiem wartości % rocznie (bez podatku, bez dopłat)
+  const props = properties.map((p) => ({ name: p.name, value: p.value, monthly: (1 + (p.growth || 0) / 100) ** (1 / 12) - 1 }));
+  const propTotal = () => props.reduce((s, p) => s + p.value, 0);
   const L = loans.filter((l) => l.balance > 0).map((l) => ({ ...l, paidOff: null }));
   if (investLoan && investLoan.amount > 0 && investLoan.months > 0) {
     b[investLoan.target || 'market'] += investLoan.amount;
@@ -50,12 +54,16 @@ export function simulate({ start, loans = [], monthly = 0, years = 10, rates, in
   const aSum = a.safe + a.market + a.retire || 1;
   const debt = () => L.reduce((s, l) => s + l.balance, 0);
   const point = (m) => {
-    const assets = b.cash + b.safe + b.market + b.retire + b.metal;
+    const prop = propTotal();
+    const assets = b.cash + b.safe + b.market + b.retire + b.metal + prop;
     const d = debt();
     const n = assets - d;
+    const defl = (1 + inflation / 100) ** (m / 12);
     return {
       month: m, cash: Math.round(b.cash), safe: Math.round(b.safe), market: Math.round(b.market), retire: Math.round(b.retire), metal: Math.round(b.metal),
-      assets: Math.round(assets), debt: Math.round(d), net: Math.round(n), netReal: Math.round(n / (1 + inflation / 100) ** (m / 12)),
+      property: Math.round(prop), assets: Math.round(assets), debt: Math.round(d), net: Math.round(n), netReal: Math.round(n / defl),
+      liquid: Math.round(n - prop), // majątek bez nieruchomości i innych aktywów
+      props: props.map((p) => Math.round(p.value)),
     };
   };
   const series = [point(0)];
@@ -63,6 +71,7 @@ export function simulate({ start, loans = [], monthly = 0, years = 10, rates, in
   const total = Math.round(years * 12);
   for (let m = 1; m <= total; m++) {
     for (const k of ['safe', 'market', 'retire', 'metal']) b[k] *= 1 + monthlyRate[k];
+    for (const p of props) p.value *= 1 + p.monthly;
     // raty
     let paid = 0;
     for (const l of L) {
@@ -109,6 +118,7 @@ export function simulate({ start, loans = [], monthly = 0, years = 10, rates, in
   return {
     series, final, interestPaid: Math.round(interestPaid),
     payoffs: L.map((l) => ({ name: l.name, month: l.paidOff, left: Math.round(l.balance), invest: !!l.invest })),
+    properties: props.map((p, i) => ({ name: p.name, start: series[0].props[i], end: final.props[i] })),
     milestones,
   };
 }

@@ -1,6 +1,6 @@
 # Smart Finance
 
-Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.7.0**.
+Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.8.0**.
 Dane zapisują się **tylko w Twoim telefonie** — nic nie trafia na serwer.
 
 Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
@@ -27,6 +27,11 @@ Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
 - Wyceny inwestycji: „Aktualizuj wartość” kwotą albo procentem, historia wycen z wykresem; wpłaty oddzielone od zysku
 - Złoto i srebro: ilość w gramach/uncjach, próba, cena skupu; ceny automatycznie (złoto: NBP, srebro: gold-api.com × kurs USD z NBP), wykres cen
 - Symulacja majątku (Plany → Symulacja): horyzont do 30 lat, zwroty, inflacja, podatek Belki, nadpłaty kredytów, kamienie milowe, scenariusze; analiza kredytu inwestycyjnego z progiem opłacalności
+- Nieruchomości i inne aktywa (mieszkanie, dom, działka, auto…): wartość, wyceny, powiązany kredyt („Twoje: X%”), wzrost/spadek % w symulacji, majątek płynny
+- Usuwanie konta razem z transakcjami (do Kosza, z przywracaniem)
+- Ikony generowane bez internetu (kolory banków i firm, inicjały, ikony rodzaju); obrazki: z telefonu albo wyszukiwarka po tagu (Openverse, Wikimedia Commons)
+- Profil (imię, avatar), animacja startowa 2 s, blokada PIN-em / odciskiem palca (opcjonalna)
+- Skróty z ikony aplikacji (przytrzymaj ikonę: Dodaj wydatek / przychód / Dyktuj / Plan) i dyktowanie głosem
 - Działa offline, instalacja na Androidzie
 
 ## Wdrożenie na GitHub Pages (bez terminala)
