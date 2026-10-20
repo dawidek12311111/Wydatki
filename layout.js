@@ -3,12 +3,13 @@
 export const DASH_CARDS = {
   balance: { label: 'Bilans miesiąca', icon: '📊' },
   quick: { label: 'Szybkie dodawanie', icon: '⚡' },
-  bills: { label: 'Do zapłaty', icon: '🧾' },
+  bills: { label: 'Plan miesiąca', icon: '🗓️' },
   networth: { label: 'Majątek netto', icon: '🏛️' },
   savings: { label: 'Oszczędności i inwestycje', icon: '🐷' },
   loans: { label: 'Kredyty', icon: '📉' },
   categories: { label: 'Na co poszło', icon: '🍰' },
   recent: { label: 'Ostatnie transakcje', icon: '🧾' },
+  purchases: { label: 'Do kupienia', icon: '🛒' },
 };
 
 export const DEFAULT_LAYOUT = [
@@ -20,6 +21,7 @@ export const DEFAULT_LAYOUT = [
   { id: 'quick', visible: false },
   { id: 'savings', visible: false },
   { id: 'loans', visible: false },
+  { id: 'purchases', visible: false },
 ];
 
 /** Naprawia zapisany układ: usuwa nieznane/zdublowane karty, dopisuje nowe na końcu. */

@@ -3,10 +3,10 @@
 import { DEFAULT_CATEGORIES, DEFAULT_ACCOUNTS } from './defaults.js';
 
 const DB_NAME = 'smart-finance';
-const DB_VERSION = 2; // 2: lista „Do zapłaty” (bills)
-export const SCHEMA_VERSION = 2;
-const STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills', 'settings'];
-const DATA_STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills'];
+const DB_VERSION = 3; // 2: lista „Do zapłaty” (bills), 3: „Do kupienia” (purchases)
+export const SCHEMA_VERSION = 3;
+const STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills', 'purchases', 'settings'];
+const DATA_STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills', 'purchases'];
 
 let dbPromise;
 
@@ -86,16 +86,28 @@ export const setSetting = (key, value) => put('settings', { id: key, value });
 export async function ensureDefaults() {
   if (await getSetting('initialized')) return false;
   const now = new Date().toISOString();
-  await put('categories', ...DEFAULT_CATEGORIES.map((c) => ({ parentId: null, archived: false, ...c })));
+  await put('categories', ...DEFAULT_CATEGORIES.map(({ since, ...c }) => ({ parentId: null, archived: false, ...c })));
+  await setSetting('catsVersion', 2);
   await put('accounts', ...DEFAULT_ACCOUNTS.map((a) => ({ archived: false, createdAt: now, ...a })));
   await setSetting('initialized', now);
   await setSetting('schemaVersion', SCHEMA_VERSION);
   return true;
 }
 
+/** Dodaje kategorie wprowadzone w nowszych wersjach (nie nadpisuje istniejących). */
+export async function migrate() {
+  const done = await getSetting('catsVersion', 1);
+  if (done >= 2) return;
+  const existing = new Set((await getAll('categories')).map((c) => c.id));
+  const added = DEFAULT_CATEGORIES.filter((c) => c.since === 2 && !existing.has(c.id))
+    .map(({ since, ...c }) => ({ parentId: null, archived: false, ...c }));
+  if (added.length) await put('categories', ...added);
+  await setSetting('catsVersion', 2);
+}
+
 export async function loadAll() {
-  const [accounts, categories, transactions, budgets, bills] = await Promise.all(DATA_STORES.map(getAll));
-  return { accounts, categories, transactions, budgets, bills };
+  const [accounts, categories, transactions, budgets, bills, purchases] = await Promise.all(DATA_STORES.map(getAll));
+  return { accounts, categories, transactions, budgets, bills, purchases };
 }
 
 export async function exportBackup() {

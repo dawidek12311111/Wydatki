@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' https://generativelanguage.googleapis.com; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#0b1412" media="(prefers-color-scheme: dark)">
   <meta name="description" content="Prywatna aplikacja do budżetu domowego. Dane zostają w Twoim telefonie.">
@@ -37,9 +37,9 @@
   <nav class="tabbar" aria-label="Główna nawigacja">
     <a href="#dashboard" data-tab="dashboard"><svg viewBox="0 0 24 24"><path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-3H4zM14 4v3h6V4z"/></svg><span>Start</span></a>
     <a href="#transactions" data-tab="transactions"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span>Transakcje</span></a>
-    <a href="#budget" data-tab="budget"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 4v8l6 4"/></svg><span>Budżet</span></a>
+    <a href="#budget" data-tab="budget"><svg viewBox="0 0 24 24"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4M8 14h2M14 14h2M8 17h2"/></svg><span>Miesiąc</span></a>
     <a href="#wealth" data-tab="wealth"><svg viewBox="0 0 24 24"><path d="M3 10l9-6 9 6M5 10v9M19 10v9M9 10v9M15 10v9M3 20h18"/></svg><span>Majątek</span></a>
-    <a href="#analytics" data-tab="analytics"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Analityka</span></a>
+    <a href="#plans" data-tab="plans"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="4"/><path d="M12 12l7-7M16 5h3v3"/></svg><span>Plany</span></a>
     <a href="#settings" data-tab="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg><span>Ustawienia</span></a>
   </nav>
 

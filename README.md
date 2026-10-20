@@ -1,6 +1,6 @@
 # Smart Finance
 
-Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.4.0**.
+Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.5.0**.
 Dane zapisują się **tylko w Twoim telefonie** — nic nie trafia na serwer.
 
 Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
@@ -10,15 +10,18 @@ Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
 - Dodawanie przychodów, wydatków i transferów; szybki tekst („Paliwo 250 zł dzisiaj”); ostatnie operacje jednym dotknięciem
 - Zwroty, tagi, oznaczenie „cykliczna”, inne waluty (zapisywane osobno, bez przeliczania)
 - Kategorie i podkategorie (edycja, ukrywanie, słowa kluczowe)
-- Budżet = lista „Do zapłaty” na każdy miesiąc: opis, kwota, ikona, ✓ zapłacone / ✕ niezapłacone, kopiowanie listy z poprzedniego miesiąca
+- Plan miesiąca (zakładka Miesiąc): wpływy (rodzaj, opis, kwota, dzień) i „Do zapłaty”; ✓/✕; odhaczenie dodaje transakcję (przychód/wydatek), odznaczenie ją usuwa; kopiowanie z poprzedniego miesiąca z podglądem (odznacz, popraw kwoty)
+- Kalendarz po dotknięciu nazwy miesiąca: widok miesiąca (dni z kropkami, szczegóły dnia) i roku (bilans/plan każdego miesiąca)
+- Plany: „Do kupienia” (cena, priorytet, termin, zgromadzone, kredyt, zwrot inwestycji) z analizą: dane rzeczywiste / szacunki / założenia
+- Asystent AI (Gemini): pytania o finanse; klucz tylko w telefonie; do AI idą wyłącznie zagregowane sumy
 - Majątek: oszczędności i inwestycje (lokata, IKE, IKZE, PPK, ETF, obligacje, krypto, inne) z opisem, sumą, wpłatą i wypłatą
 - Kredyty: spłaty, stan przed/po w danym miesiącu, postęp spłaty
 - Konta bieżące z saldem początkowym, majątek netto (aktywa − zobowiązania)
-- Analityka: 6 miesięcy na wykresie, średnie 3/6/12 mies., porównanie z poprzednim miesiącem i rokiem wcześniej
+- Analiza (Plany → Analiza): 6 miesięcy na wykresie, średnie 3/6/12 mies., porównanie z poprzednim miesiącem i rokiem wcześniej
 - Kopia zapasowa JSON, przywracanie, eksport CSV (polski Excel), kosz z „Cofnij”
 - Ustawienia: 8 kolorów aplikacji, jasny/ciemny motyw, rozmiar tekstu, tryb prywatny (rozmyte kwoty, przycisk z okiem), domyślne konto, wibracja
 - Przytrzymanie kafelka otwiera menu: transakcja (edytuj, duplikuj, usuń), rachunek (zapłacone, kopiuj na następny miesiąc, duplikuj, usuń), konto (wpłata/wypłata/spłata, historia, edytuj, archiwizuj), karta na stronie startowej (wyżej, niżej, ukryj)
-- Własny układ strony startowej: 8 kart do wyboru (w tym Szybkie dodawanie, Oszczędności, Kredyty), dowolna kolejność
+- Własny układ strony startowej: 9 kart do wyboru (w tym Szybkie dodawanie, Oszczędności, Kredyty, Do kupienia), dowolna kolejność
 - Działa offline, instalacja na Androidzie
 
 ## Wdrożenie na GitHub Pages (bez terminala)

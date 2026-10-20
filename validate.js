@@ -47,6 +47,24 @@ export function validateBill(b) {
   else if (b.amount > MAX_AMOUNT) errors.push('Kwota jest zbyt duża');
   if (typeof b.month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(b.month)) errors.push('Nieprawidłowy miesiąc');
   if (typeof b.paid !== 'boolean') errors.push('Nieprawidłowy status');
+  if (b.kind != null && b.kind !== 'income' && b.kind !== 'expense') errors.push('Nieprawidłowy rodzaj pozycji');
+  if (b.day != null && (!Number.isInteger(b.day) || b.day < 1 || b.day > 31)) errors.push('Dzień musi być od 1 do 31');
+  return errors;
+}
+
+/** Pozycja „Do kupienia”. */
+export function validatePurchase(p) {
+  const errors = [];
+  if (!p || typeof p !== 'object') return ['Brak danych'];
+  if (typeof p.name !== 'string' || !p.name.trim()) errors.push('Wpisz nazwę');
+  if (!Number.isInteger(p.price) || p.price <= 0) errors.push('Cena musi być większa od zera');
+  else if (p.price > MAX_AMOUNT) errors.push('Cena jest zbyt duża');
+  for (const [k, label] of [['monthlySaving', 'Miesięczna wpłata'], ['monthlyBenefit', 'Miesięczna korzyść'], ['loanOwn', 'Wkład własny'], ['savedManual', 'Zgromadzone']]) {
+    if (p[k] != null && (!Number.isInteger(p[k]) || p[k] < 0)) errors.push(`${label}: nieprawidłowa kwota`);
+  }
+  if (p.loanRate != null && !(p.loanRate >= 0 && p.loanRate <= 50)) errors.push('Oprocentowanie od 0 do 50%');
+  if (p.loanMonths != null && !(Number.isInteger(p.loanMonths) && p.loanMonths > 0 && p.loanMonths <= 480)) errors.push('Okres kredytu: 1–480 miesięcy');
+  if (p.targetYm != null && !/^\d{4}-(0[1-9]|1[0-2])$/.test(p.targetYm)) errors.push('Nieprawidłowy termin');
   return errors;
 }
 
@@ -72,6 +90,7 @@ export function validateBackup(data) {
     if (!Array.isArray(data.bills) || !ids(data.bills)) errors.push('Uszkodzona lista „Do zapłaty”');
     else if (data.bills.some((b) => validateBill(b).length)) errors.push('Nieprawidłowe pozycje na liście „Do zapłaty”');
   }
+  if (data.purchases != null && (!Array.isArray(data.purchases) || !ids(data.purchases))) errors.push('Uszkodzona lista „Do kupienia”');
   return {
     ok: errors.length === 0,
     errors,

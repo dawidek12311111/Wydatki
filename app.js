@@ -2,24 +2,29 @@
 import * as db from './db.js';
 import {
   balances, netWorth, monthSummary, rollupByParent, averages, effectOnAccount,
-  monthlySeries, categoryChanges, isLive, accountMonth, billsSummary, billsToCopy,
+  monthlySeries, categoryChanges, isLive, accountMonth,
 } from './calc.js';
 import { toMinor, formatMoney, minorToInput } from './money.js';
-import { todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, formatDatePL } from './dates.js';
+import { todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, formatDatePL, dateInMonth, WEEKDAYS_SHORT } from './dates.js';
 import { parseQuick, guessCategory } from './parse.js';
-import { validateTransaction, validateBackup, validateBill } from './validate.js';
+import { validateTransaction, validateBackup, validateBill, validatePurchase } from './validate.js';
 import { transactionsToCSV } from './csv.js';
 import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
+import { kindOf, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
+import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS } from './purchases.js';
+import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.4.0';
+export const APP_VERSION = '0.5.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (m, cur = 'PLN', o) => `<span class="num">${esc(formatMoney(m, cur, o))}</span>`;
 
 const state = {
-  data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [] },
+  data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
+  plansTab: 'buy',
+  buyFilter: 'active',
   view: 'dashboard',
   month: monthKey(todayISO()),
   txFilter: 'all',
@@ -33,9 +38,9 @@ const state = {
 const VIEWS = {
   dashboard: { title: 'Start', month: true },
   transactions: { title: 'Transakcje', month: true },
-  budget: { title: 'Do zapłaty', month: true },
+  budget: { title: 'Plan', month: true },
   wealth: { title: 'Majątek', month: true },
-  analytics: { title: 'Analityka', month: true },
+  plans: { title: 'Plany', month: true },
   settings: { title: 'Ustawienia', month: false },
 };
 
@@ -66,6 +71,16 @@ function amountClass(t) {
   if (t.type === 'transfer') return 'tr';
   return signedAmount(t) >= 0 ? 'pos' : 'neg';
 }
+/** Ustawia kursor w polu po otwarciu okienka — ale nie, jeśli użytkownik zaczął już pisać gdzie indziej. */
+function focusLater(sel) {
+  setTimeout(() => {
+    const sheet = $('#sheet');
+    const active = document.activeElement;
+    if (active && active !== sheet && sheet.contains(active) && active.matches('input, textarea, select')) return;
+    $(sel)?.focus();
+  }, 50);
+}
+const dec1 = (x) => x.toFixed(1).replace('.', ',');
 const pct = (x) => (x == null ? '—' : `${Math.round(x * 100)}%`);
 
 function txRow(t, cats = catById(), accs = accById()) {
@@ -110,7 +125,8 @@ async function reload() {
 
 // ---------- nawigacja ----------
 function route() {
-  const v = location.hash.slice(1);
+  let v = location.hash.slice(1);
+  if (v === 'analytics') { v = 'plans'; state.plansTab = 'analysis'; } // stary adres
   state.view = VIEWS[v] ? v : 'dashboard';
   render();
   window.scrollTo(0, 0);
@@ -126,7 +142,7 @@ function render() {
   });
   const html = {
     dashboard: viewDashboard, transactions: viewTransactions, budget: viewBudget,
-    wealth: viewWealth, analytics: viewAnalytics, settings: viewSettings,
+    wealth: viewWealth, plans: viewPlans, settings: viewSettings,
   }[state.view]();
   $('#view').innerHTML = html;
   if (state.view === 'transactions') {
@@ -174,17 +190,30 @@ function viewDashboard() {
     },
 
     bills: () => {
-      const bs = billsSummary(state.data.bills, state.month);
-      const unpaid = billsOfMonth().filter((b) => !b.paid);
-      return `<section class="card" ${lp('bills')}><h2>Do zapłaty <a href="#budget">Lista ›</a></h2>
-        ${bs.count ? `<div class="stat-row">
-          <div class="stat"><small>Zostało</small><b class="${bs.left > 0 ? 'neg' : 'pos'}">${money(bs.left)}</b></div>
-          <div class="stat"><small>Zapłacone</small><b>${money(bs.paid)}</b></div>
-          <div class="stat"><small>Opłacone</small><b>${bs.paidCount} / ${bs.count}</b></div>
+      const ps = planSummary(state.data.bills, state.month);
+      const open = billsOfMonth().filter((b) => !b.paid);
+      const count = ps.income.count + ps.expense.count;
+      return `<section class="card" ${lp('bills')}><h2>Plan miesiąca <a href="#budget">Plan ›</a></h2>
+        ${count ? `<div class="stat-row">
+          <div class="stat"><small>Wpłynęło</small><b class="pos">${money(ps.income.done)}</b><small>z ${esc(formatMoney(ps.income.total))}</small></div>
+          <div class="stat"><small>Do zapłaty</small><b class="${ps.expense.left > 0 ? 'neg' : 'pos'}">${money(ps.expense.left)}</b><small>${ps.expense.doneCount}/${ps.expense.count} opłacone</small></div>
+          <div class="stat"><small>Zostanie</small><b class="${ps.plannedNet < 0 ? 'neg' : ''}">${money(ps.plannedNet)}</b><small>wg planu</small></div>
         </div>
-        ${unpaid.length ? `<p class="small muted" style="margin:10px 0 0">Niezapłacone: ${unpaid.slice(0, 4).map((b) => esc(b.icon || '') + ' ' + esc(b.name)).join(', ')}${unpaid.length > 4 ? '…' : ''}</p>` : ''}`
-        : '<p class="muted small">Brak pozycji na ten miesiąc. <a class="link" href="#budget">Dodaj</a></p>'}
+        ${open.length ? `<p class="small muted" style="margin:10px 0 0">Czeka: ${open.slice(0, 4).map((b) => esc(b.icon || '') + ' ' + esc(b.name)).join(', ')}${open.length > 4 ? '…' : ''}</p>` : ''}`
+        : '<p class="muted small">Brak planu na ten miesiąc. <a class="link" href="#budget">Zaplanuj</a></p>'}
       </section>`;
+    },
+
+    purchases: () => {
+      const prio = { high: 0, mid: 1, low: 2 };
+      const list = state.data.purchases.filter((p) => p.status !== 'bought').sort((a, b) => (prio[a.priority] ?? 1) - (prio[b.priority] ?? 1)).slice(0, 3);
+      return `<section class="card" ${lp('purchases')}><h2>Do kupienia <a href="#plans" data-action="plans-tab" data-tab2="buy">Plany ›</a></h2>
+        ${list.length ? `<ul class="bars">${list.map((p) => {
+          const a = analyzePurchase(p, purchaseContext(p));
+          return `<li><div class="row"><span>${esc(p.icon || '🛒')} ${esc(p.name)}</span><span class="num">${Math.round(a.progress * 100)}%</span></div>
+            <div class="track"><div class="fill" style="width:${(a.progress * 100).toFixed(1)}%"></div></div>
+            <div class="small muted">${a.missing === 0 ? 'Masz już całą kwotę' : a.affordYm ? 'Szacunkowo: ' + esc(monthNamePL(a.affordYm).toLowerCase()) : 'brakuje ' + esc(formatMoney(a.missing))}</div></li>`;
+        }).join('')}</ul>` : '<p class="muted small">Brak planowanych zakupów.</p>'}</section>`;
     },
 
     savings: () => {
@@ -282,117 +311,238 @@ function renderTxList() {
   if (el) el.innerHTML = txListHtml();
 }
 
-// ---------- Budżet: lista „Do zapłaty” ----------
-function billsOfMonth(ym = state.month) {
-  return state.data.bills.filter((b) => b.month === ym)
-    .sort((a, b) => (a.order || 0) - (b.order || 0) || (a.createdAt || '').localeCompare(b.createdAt || ''));
+// ---------- Plan miesiąca: wpływy i „Do zapłaty” ----------
+function billsOfMonth(ym = state.month, kind = null) {
+  return state.data.bills
+    .filter((b) => b.month === ym && (!kind || kindOf(b) === kind))
+    .sort((a, b) => (a.day || 99) - (b.day || 99) || (a.order || 0) - (b.order || 0) || (a.createdAt || '').localeCompare(b.createdAt || ''));
+}
+const autoTxOn = () => getPref('sf-autotx', '1') === '1';
+
+function defaultAccountId() {
+  const active = activeAccounts().filter((a) => accountGroup(a) === 'current');
+  return (active.find((a) => a.id === state.prefs.defaultAccount) || active.find((a) => a.type === 'checking') || active[0])?.id || null;
 }
 
-function billRow(b) {
+function planRow(b) {
+  const inc = kindOf(b) === 'income';
+  const linked = b.txId && state.data.transactions.some((t) => t.id === b.txId && !t.deletedAt);
+  const doneLabel = inc ? 'Wpłynęło' : 'Zapłacone';
+  const openLabel = inc ? 'Jeszcze nie wpłynęło' : 'Niezapłacone';
   return `<div class="item bill ${b.paid ? 'is-paid' : ''}" data-lp="bill:${esc(b.id)}">
     <button class="bill-main" data-action="edit-bill" data-id="${esc(b.id)}">
-      <span class="ico" aria-hidden="true">${esc(b.icon || '📄')}</span>
-      <span class="mid"><span class="t1">${esc(b.name)}</span><span class="t2 num">${esc(formatMoney(b.amount))}${b.note ? ' · ' + esc(b.note) : ''}</span></span>
+      <span class="ico" aria-hidden="true">${esc(b.icon || (inc ? '💰' : '📄'))}</span>
+      <span class="mid"><span class="t1">${esc(b.name)}${linked ? '<span class="badge">w transakcjach</span>' : ''}</span>
+      <span class="t2"><span class="num ${inc ? 'pos' : ''}">${inc ? '+' : ''}${esc(formatMoney(b.amount))}</span>${b.day ? ` · ${b.day}. dnia` : ''}${b.note ? ' · ' + esc(b.note) : ''}</span></span>
     </button>
     <button class="paybtn ${b.paid ? 'paid' : 'unpaid'}" data-action="toggle-bill" data-id="${esc(b.id)}"
-      aria-label="${b.paid ? 'Zapłacone — dotknij, aby oznaczyć jako niezapłacone' : 'Niezapłacone — dotknij, aby oznaczyć jako zapłacone'}">${b.paid ? '✓' : '✕'}</button>
+      aria-label="${b.paid ? doneLabel : openLabel} — dotknij, aby zmienić">${b.paid ? '✓' : '✕'}</button>
   </div>`;
 }
+const billRow = planRow;
 
 function viewBudget() {
   const ym = state.month;
-  const list = billsOfMonth(ym);
-  const s = billsSummary(state.data.bills, ym);
+  const s = planSummary(state.data.bills, ym);
+  const incomes = billsOfMonth(ym, 'income');
+  const expenses = billsOfMonth(ym, 'expense');
   const prevYm = addMonths(ym, -1);
-  const toCopy = billsToCopy(state.data.bills, prevYm, ym);
-  const progress = s.total ? (s.paid / s.total) * 100 : 0;
+  const toCopy = planToCopy(state.data.bills, prevYm, ym);
+  const monthWord = esc(monthNamePL(ym).toLowerCase());
+  const section = (kind, list, title, sumDone, sumTotal) => `
+    <div class="sec-head"><h2>${title}</h2><span class="small muted num">${esc(formatMoney(sumDone))} z ${esc(formatMoney(sumTotal))}</span></div>
+    ${list.length ? `<div class="list">${list.map(planRow).join('')}</div>` : `<p class="muted small" style="margin:0 4px">${kind === 'income' ? 'Dodaj pensję, świadczenia i inne wpływy.' : 'Dodaj rachunki i opłaty.'}</p>`}
+    <button class="btn block" style="margin-top:8px" data-action="add-bill" data-kind="${kind}">+ ${kind === 'income' ? 'Dodaj wpływ' : 'Dodaj do zapłaty'}</button>`;
   return `<section class="card hero">
-      <h2>Do zapłaty: ${esc(monthNamePL(ym).toLowerCase())}</h2>
-      <div class="big num">${esc(formatMoney(s.left))}</div>
+      <h2>Plan: ${monthWord}</h2>
+      <div class="big num">${esc(formatMoney(s.plannedNet, 'PLN', { sign: true }))}</div>
       <div class="split">
-        <div><small>Razem</small><b class="num">${esc(formatMoney(s.total))}</b></div>
-        <div><small>Zapłacone</small><b class="num">${esc(formatMoney(s.paid))}</b></div>
+        <div><small>Wpływy</small><b class="num">${esc(formatMoney(s.income.total))}</b><small>wpłynęło ${s.income.doneCount}/${s.income.count}</small></div>
+        <div><small>Do zapłaty</small><b class="num">${esc(formatMoney(s.expense.total))}</b><small>zostało <span class="num">${esc(formatMoney(s.expense.left))}</span></small></div>
       </div>
-      <div class="track light"><div class="fill" style="width:${progress.toFixed(1)}%"></div></div>
-      <div class="foot">${s.count ? `Opłacone ${s.paidCount} z ${s.count}${s.left === 0 ? ' — wszystko zapłacone 🎉' : ''}` : 'Lista jest pusta'}</div>
+      <div class="foot">Tyle zostanie po planowanych opłatach. Na dziś: <b class="num">${esc(formatMoney(s.doneNet, 'PLN', { sign: true }))}</b></div>
     </section>
-    ${list.length ? `<div class="list">${list.map(billRow).join('')}</div>` : `<div class="empty"><span class="em">🧾</span>Dodaj rachunki i opłaty na ${esc(monthNamePL(ym).toLowerCase())}.</div>`}
-    <div class="actions">
-      <button class="btn primary block" data-action="add-bill">+ Dodaj do zapłaty</button>
-      ${toCopy.length ? `<button class="btn block" data-action="copy-bills">Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
-    </div>
-    <p class="note">Dotknij ✕ / ✓, żeby zmienić status. Dotknij nazwy, żeby edytować. Strzałkami u góry przejdziesz na kolejny miesiąc i zaplanujesz opłaty z wyprzedzeniem.</p>`;
+    ${toCopy.length ? `<button class="btn primary block" data-action="copy-bills">⧉ Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
+    ${section('income', incomes, 'Wpływy', s.income.done, s.income.total)}
+    ${section('expense', expenses, 'Do zapłaty', s.expense.done, s.expense.total)}
+    <p class="note">Dotknij ✕ / ✓, żeby zmienić status${autoTxOn() ? ' — odhaczenie od razu dodaje transakcję (przychód lub wydatek), odznaczenie ją usuwa' : ''}. Nazwa miesiąca u góry otwiera kalendarz, strzałki przenoszą na kolejny miesiąc.</p>`;
 }
 
-function openBillSheet(id) {
+/** Tworzy, aktualizuje albo usuwa transakcję powiązaną z pozycją planu. Zwraca nowe txId. */
+async function syncPlanTx(item) {
+  const linked = item.txId ? state.data.transactions.find((t) => t.id === item.txId && !t.deletedAt) : null;
+  const kind = kindOf(item);
+  const categoryId = item.categoryId
+    || guessCategory(item.name, state.data.categories, state.data.transactions, kind)
+    || (kind === 'income' ? 'inc-other' : 'exp-other');
+  if (item.paid) {
+    if (linked) {
+      const upd = { ...linked, type: kind, amount: item.amount, description: item.name, categoryId, updatedAt: new Date().toISOString() };
+      if (item.accountId) upd.accountId = item.accountId;
+      if (!validateTransaction(upd, state.data).length) await db.put('transactions', upd);
+      return linked.id;
+    }
+    if (!autoTxOn()) return null;
+    const now = new Date().toISOString();
+    const t = {
+      id: db.newId('tx'), createdAt: now, updatedAt: now,
+      ...autoTransaction({ ...item, categoryId }, { today: todayISO(), accountId: defaultAccountId(), fallbackCategory: categoryId }),
+    };
+    const errors = validateTransaction(t, state.data);
+    if (errors.length) { toast('Nie dodano transakcji: ' + errors.join(', ')); return null; }
+    await db.put('transactions', t);
+    return t.id;
+  }
+  if (linked) await db.put('transactions', { ...linked, deletedAt: new Date().toISOString() });
+  return null;
+}
+
+function openBillSheet(id, kindArg) {
   const b = id ? state.data.bills.find((x) => x.id === id) : null;
-  let icon = b?.icon || BILL_ICONS[0];
-  openSheet(b ? 'Edytuj pozycję' : `Do zapłaty: ${monthNamePL(state.month).toLowerCase()}`, `
-    <label class="field"><span>Co trzeba zapłacić</span><input id="bl-name" maxlength="80" value="${esc(b?.name || '')}" placeholder="np. Czynsz, Prąd, Przedszkole" autocomplete="off"></label>
+  let kind = b ? kindOf(b) : (kindArg === 'income' ? 'income' : 'expense');
+  let categoryId = b?.categoryId || null;
+  let icon = b?.icon || null;
+  let iconCustom = !!b?.icon;
+  const accs = activeAccounts().filter((a) => accountGroup(a) === 'current');
+  openSheet(b ? 'Edytuj pozycję planu' : `Plan: ${monthNamePL(state.month).toLowerCase()}`, `
+    ${b ? '' : `<div class="seg" id="bl-kind"><button type="button" data-kind="income">Wpływ</button><button type="button" data-kind="expense">Do zapłaty</button></div>`}
+    <label class="field"><span id="bl-name-label">Opis</span><input id="bl-name" maxlength="80" value="${esc(b?.name || '')}" autocomplete="off"></label>
     <label class="field"><span>Kwota</span><input id="bl-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${b ? esc(minorToInput(b.amount)) : ''}" autocomplete="off"></label>
-    <div class="field"><span>Ikona</span><div class="icongrid" id="bl-icons">${BILL_ICONS.map((i) => `<button type="button" data-icon="${i}" aria-pressed="${i === icon}">${i}</button>`).join('')}</div>
-      <input id="bl-icon-custom" maxlength="4" placeholder="lub wpisz własne emoji" value="${BILL_ICONS.includes(icon) ? '' : esc(icon)}"></div>
-    <label class="field"><span>Notatka (opcjonalnie)</span><input id="bl-note" maxlength="80" value="${esc(b?.note || '')}" placeholder="np. termin 10-go, nr konta w mailu"></label>
-    <label class="check"><input type="checkbox" id="bl-paid" ${b?.paid ? 'checked' : ''}> Zapłacone</label>
+    <div class="field"><span id="bl-cat-label">Rodzaj</span><div class="catgrid" id="bl-cats"></div></div>
+    <div class="grid2">
+      <label class="field"><span>Dzień miesiąca (opcj.)</span><input id="bl-day" type="number" inputmode="numeric" min="1" max="31" placeholder="np. 10" value="${b?.day || ''}"></label>
+      <label class="field"><span>Konto</span><select id="bl-acc"><option value="">Domyślne</option>${accs.map((a) => `<option value="${esc(a.id)}" ${b?.accountId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
+    </div>
+    <details class="more" ${b?.note || (b?.icon && kind === 'expense') ? 'open' : ''}><summary>Ikona i notatka</summary>
+      <div class="field"><span>Ikona</span><div class="icongrid" id="bl-icons">${BILL_ICONS.map((i) => `<button type="button" data-icon="${i}">${i}</button>`).join('')}</div>
+        <input id="bl-icon-custom" maxlength="4" placeholder="lub wpisz własne emoji" value="${b?.icon && !BILL_ICONS.includes(b.icon) ? esc(b.icon) : ''}"></div>
+      <label class="field"><span>Notatka</span><input id="bl-note" maxlength="80" value="${esc(b?.note || '')}" placeholder="np. termin, nr umowy"></label>
+    </details>
+    <label class="check"><input type="checkbox" id="bl-paid" ${b?.paid ? 'checked' : ''}> <span id="bl-paid-label"></span></label>
     <div class="err" id="bl-err" role="alert"></div>
     <div class="actions ${b ? 'two' : ''}">
       ${b ? '<button class="btn danger" id="bl-del">Usuń</button>' : ''}
       <button class="btn primary block" id="bl-save">${b ? 'Zapisz' : 'Dodaj'}</button>
     </div>`);
-  const grid = $('#bl-icons');
-  grid.onclick = (e) => {
-    const btn = e.target.closest('[data-icon]');
-    if (!btn) return;
-    icon = btn.dataset.icon;
+  const sheet = $('#sheet');
+  const cats = () => state.data.categories.filter((c) => c.kind === kind && (!c.archived || c.id === categoryId));
+  const paintIcons = () => sheet.querySelectorAll('#bl-icons [data-icon]').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.icon === icon)));
+  const paint = () => {
+    sheet.querySelectorAll('#bl-kind [data-kind]').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.kind === kind)));
+    $('#bl-name-label').textContent = kind === 'income' ? 'Opis wpływu' : 'Co trzeba zapłacić';
+    $('#bl-name').placeholder = kind === 'income' ? 'np. Pensja Ani, 800+ Zosia' : 'np. Czynsz, Prąd, Przedszkole';
+    $('#bl-cat-label').textContent = kind === 'income' ? 'Rodzaj wpływu' : 'Kategoria (do transakcji)';
+    $('#bl-paid-label').textContent = kind === 'income' ? 'Już wpłynęło' : 'Już zapłacone';
+    if (categoryId && !cats().some((c) => c.id === categoryId)) categoryId = null;
+    $('#bl-cats').innerHTML = cats().map((c) => `<button type="button" class="cat" data-cat="${esc(c.id)}" aria-pressed="${c.id === categoryId}"><b>${esc(c.icon || '•')}</b>${esc(c.name)}</button>`).join('');
+    paintIcons();
+  };
+  paint();
+  $('#bl-kind') && ($('#bl-kind').onclick = (e) => {
+    const x = e.target.closest('[data-kind]');
+    if (!x) return;
+    kind = x.dataset.kind;
+    if (!iconCustom) icon = null;
+    paint();
+  });
+  $('#bl-cats').onclick = (e) => {
+    const x = e.target.closest('[data-cat]');
+    if (!x) return;
+    categoryId = x.dataset.cat;
+    if (!iconCustom) icon = catById()[categoryId]?.icon || null;
+    paint();
+  };
+  $('#bl-icons').onclick = (e) => {
+    const x = e.target.closest('[data-icon]');
+    if (!x) return;
+    icon = x.dataset.icon;
+    iconCustom = true;
     $('#bl-icon-custom').value = '';
-    grid.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+    paintIcons();
   };
-  $('#bl-icon-custom').oninput = (e) => {
-    if (e.target.value.trim()) grid.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', 'false'));
+  $('#bl-name').onchange = () => {
+    if (categoryId) return;
+    const g = guessCategory($('#bl-name').value, state.data.categories, state.data.transactions, kind);
+    if (g) { categoryId = g; if (!iconCustom) icon = catById()[g]?.icon || null; paint(); }
   };
-  if (!b) setTimeout(() => $('#bl-name').focus(), 50);
+  if (!b) focusLater('#bl-name');
   $('#bl-save').onclick = async () => {
-    const paid = $('#bl-paid').checked;
+    const dayRaw = $('#bl-day').value.trim();
+    const custom = $('#bl-icon-custom').value.trim();
     const item = {
-      ...(b || { id: db.newId('bill'), month: state.month, createdAt: new Date().toISOString(), order: Date.now() }),
+      ...(b || { id: db.newId('bill'), month: state.month, createdAt: new Date().toISOString(), order: Date.now(), txId: null }),
+      kind,
       name: $('#bl-name').value.trim(),
       amount: toMinor($('#bl-amount').value),
-      icon: $('#bl-icon-custom').value.trim() || icon,
+      categoryId,
+      icon: custom || icon || catById()[categoryId]?.icon || (kind === 'income' ? '💰' : '📄'),
+      day: dayRaw ? Number(dayRaw) : null,
+      accountId: $('#bl-acc').value || null,
       note: $('#bl-note').value.trim(),
-      paid,
-      paidAt: paid ? (b?.paidAt || new Date().toISOString()) : null,
+      paid: $('#bl-paid').checked,
     };
+    item.paidAt = item.paid ? (b?.paidAt || new Date().toISOString()) : null;
     const errors = validateBill(item);
     if (errors.length) { $('#bl-err').textContent = errors.join(' · '); return; }
+    item.txId = await syncPlanTx(item);
     await db.put('bills', item);
     closeSheet();
     await reload();
-    toast(b ? 'Zapisano' : 'Dodano do listy');
+    toast(b ? 'Zapisano' : 'Dodano do planu');
   };
-  if (b) {
-    $('#bl-del').onclick = async () => {
-      await db.remove('bills', b.id);
-      closeSheet();
-      await reload();
-      toast('Usunięto z listy', { label: 'Cofnij', run: async () => { await db.put('bills', b); await reload(); } });
-    };
-  }
+  if (b) $('#bl-del').onclick = () => { closeSheet(); deleteBill(b.id); };
 }
 
 async function toggleBill(id) {
   const b = state.data.bills.find((x) => x.id === id);
   if (!b) return;
-  const paid = !b.paid;
-  await db.put('bills', { ...b, paid, paidAt: paid ? new Date().toISOString() : null });
+  const item = { ...b, paid: !b.paid, paidAt: !b.paid ? new Date().toISOString() : null };
+  const hadTx = b.txId && state.data.transactions.some((t) => t.id === b.txId && !t.deletedAt);
+  item.txId = await syncPlanTx(item);
+  await db.put('bills', item);
   await reload();
+  if (item.paid && item.txId && !hadTx) toast(`Dodano ${kindOf(item) === 'income' ? 'przychód' : 'wydatek'}: ${formatMoney(item.amount)}`);
+  else if (!item.paid && hadTx) toast('Usunięto też powiązaną transakcję (jest w koszu)');
 }
 
-async function copyBills() {
-  const items = billsToCopy(state.data.bills, addMonths(state.month, -1), state.month);
-  const now = Date.now();
-  await db.put('bills', ...items.map((b, i) => ({ ...b, id: db.newId('bill'), createdAt: new Date().toISOString(), order: now + i, paidAt: null })));
-  await reload();
-  toast(`Skopiowano ${items.length} pozycji`);
+/** Kopiowanie z poprzedniego miesiąca z podglądem: odznacz zbędne, popraw kwoty. */
+function openCopySheet() {
+  const fromYm = addMonths(state.month, -1);
+  const items = planToCopy(state.data.bills, fromYm, state.month);
+  const row = (b, i) => `<div class="copy-row">
+    <label><input type="checkbox" data-copy="${i}" checked> <span>${esc(b.icon || '')} ${esc(b.name)}${b.day ? `<small class="muted"> · ${b.day}.</small>` : ''}</span></label>
+    <input class="copy-amt" data-amt="${i}" inputmode="decimal" value="${esc(minorToInput(b.amount))}" aria-label="Kwota: ${esc(b.name)}">
+  </div>`;
+  const group = (kind, title) => {
+    const list = items.map((b, i) => [b, i]).filter(([b]) => b.kind === kind);
+    return list.length ? `<h3 class="copy-h">${title}</h3>${list.map(([b, i]) => row(b, i)).join('')}` : '';
+  };
+  openSheet(`Kopiuj z: ${monthNamePL(fromYm).toLowerCase()}`, `
+    <p class="small muted" style="margin-top:0">Odznacz, czego w tym miesiącu nie będzie, i popraw kwoty, które się zmieniły. Wszystko trafi jako niezrealizowane.</p>
+    ${group('income', 'Wpływy')}${group('expense', 'Do zapłaty')}
+    <div class="err" id="cp-err" role="alert"></div>
+    <div class="actions"><button class="btn primary block" id="cp-save">Skopiuj zaznaczone</button></div>`);
+  const count = () => $('#sheet').querySelectorAll('[data-copy]:checked').length;
+  const label = () => { $('#cp-save').textContent = `Skopiuj zaznaczone (${count()})`; $('#cp-save').disabled = !count(); };
+  label();
+  $('#sheet').querySelectorAll('[data-copy]').forEach((c) => { c.onchange = label; });
+  $('#cp-save').onclick = async () => {
+    const now = Date.now();
+    const out = [];
+    for (const c of $('#sheet').querySelectorAll('[data-copy]:checked')) {
+      const i = Number(c.dataset.copy);
+      const amount = toMinor($(`[data-amt="${i}"]`).value);
+      const { sourceId, ...base } = items[i];
+      const item = { ...base, amount, id: db.newId('bill'), createdAt: new Date().toISOString(), order: now + i };
+      const errors = validateBill(item);
+      if (errors.length) { $('#cp-err').textContent = `${items[i].name}: ${errors.join(', ')}`; return; }
+      out.push(item);
+    }
+    await db.put('bills', ...out);
+    closeSheet();
+    await reload();
+    toast(`Skopiowano ${out.length} pozycji`);
+  };
 }
 
 // ---------- Majątek ----------
@@ -621,7 +771,7 @@ async function openMoveSheet(id, mode) {
     <p class="small muted">${mode === 'pay' ? 'Spłata zmniejsza dług. Nie jest liczona jako wydatek, bo pieniądze nie znikają — spłacasz swój dług.' : 'To przeniesienie Twoich pieniędzy — nie jest liczone jako wydatek ani przychód.'}</p>
     <div class="err" id="mv-err" role="alert"></div>
     <div class="actions"><button class="btn primary block" id="mv-save">Zapisz</button></div>`);
-  setTimeout(() => $('#mv-amount').focus(), 50);
+  focusLater('#mv-amount');
   $('#mv-save').onclick = async () => {
     const other = $('#mv-other').value || null;
     const now = new Date().toISOString();
@@ -710,6 +860,371 @@ function barChart(series) {
     <text x="2" y="${top - 2}" text-anchor="start">${esc(maxLabel)}</text>${bars}</svg>`;
 }
 
+// ---------- Kalendarz ----------
+const cal = { tab: 'month', year: null, day: null };
+
+function openCalendar() {
+  cal.tab = 'month';
+  cal.year = Number(state.month.slice(0, 4));
+  cal.day = null;
+  openSheet('Kalendarz', '<div id="cal"></div>');
+  paintCalendar();
+}
+
+function paintCalendar() {
+  const box = $('#cal');
+  if (!box) return;
+  const today = todayISO();
+  const seg = `<div class="seg"><button type="button" data-cal="tab" data-v="month" aria-pressed="${cal.tab === 'month'}">Miesiąc</button>
+    <button type="button" data-cal="tab" data-v="year" aria-pressed="${cal.tab === 'year'}">Rok</button></div>`;
+  let html = seg;
+  if (cal.tab === 'year') {
+    const tiles = yearTiles(liveTx(), state.data.bills, cal.year);
+    html += `<div class="cal-nav"><button class="icon-btn" data-cal="year" data-v="-1" aria-label="Poprzedni rok">‹</button><b>${cal.year}</b>
+      <button class="icon-btn" data-cal="year" data-v="1" aria-label="Następny rok">›</button></div>
+      <div class="year-grid">${tiles.map((t) => {
+        const v = t.source === 'actual' ? t.actual : t.plan;
+        return `<button type="button" class="ytile ${t.ym === state.month ? 'sel' : ''} ${t.ym === monthKey(today) ? 'now' : ''}" data-cal="pick" data-v="${t.ym}">
+          <span class="ym">${esc(monthShortPL(t.ym))}</span>
+          <b class="num ${v == null ? 'muted' : v >= 0 ? 'pos' : 'neg'}">${v == null ? '—' : esc(formatMoney(v, 'PLN', { sign: true }).replace(/,\d\d/, ''))}</b>
+          <small>${t.source === 'plan' ? 'plan' : t.source === 'actual' ? 'bilans' : ''}</small></button>`;
+      }).join('')}</div>
+      <p class="small muted">Bilans = z transakcji. „plan” = wpływy minus opłaty z planu (miesiąc bez transakcji). Dotknij miesiąca, żeby go otworzyć.</p>`;
+  } else {
+    const ym = state.month;
+    const marks = dayMarks(liveTx(), state.data.bills, ym);
+    const s = monthSummary(liveTx(), ym);
+    const p = planSummary(state.data.bills, ym);
+    html += `<div class="cal-nav"><button class="icon-btn" data-cal="month" data-v="-1" aria-label="Poprzedni miesiąc">‹</button><b>${esc(monthNamePL(ym))}</b>
+      <button class="icon-btn" data-cal="month" data-v="1" aria-label="Następny miesiąc">›</button></div>
+      <div class="cal-grid">${WEEKDAYS_SHORT.map((d) => `<span class="wd">${d}</span>`).join('')}
+      ${calendarGrid(ym).flat().map((iso) => {
+        if (!iso) return '<span></span>';
+        const m = marks[iso];
+        const dots = m ? `<i class="dots">${m.income || m.planIncome ? '<i class="d inc"></i>' : ''}${m.expense || m.planExpense ? '<i class="d exp"></i>' : ''}${m.planOpen ? '<i class="d open"></i>' : ''}</i>` : '';
+        return `<button type="button" class="day-cell ${iso === today ? 'today' : ''} ${iso === cal.day ? 'sel' : ''}" data-cal="day" data-v="${iso}">${Number(iso.slice(8))}${dots}</button>`;
+      }).join('')}</div>
+      <div class="legend small"><span><i class="d inc"></i>wpływ</span><span><i class="d exp"></i>wydatek</span><span><i class="d open"></i>do zrobienia</span></div>
+      <div class="stat-row" style="grid-template-columns:1fr 1fr;margin-top:10px">
+        <div class="stat"><small>Bilans (transakcje)</small><b class="${s.net < 0 ? 'neg' : 'pos'}">${money(s.net, 'PLN', { sign: true })}</b></div>
+        <div class="stat"><small>Plan (wpływy − opłaty)</small><b class="${p.plannedNet < 0 ? 'neg' : ''}">${money(p.plannedNet, 'PLN', { sign: true })}</b></div>
+      </div>
+      <div id="cal-day">${cal.day ? dayDetails(cal.day) : '<p class="small muted">Dotknij dnia, żeby zobaczyć szczegóły.</p>'}</div>
+      <div class="actions two"><button class="btn" data-cal="today">Dziś</button><button class="btn primary" data-cal="plan">Zaplanuj miesiąc ›</button></div>`;
+  }
+  box.innerHTML = html;
+  box.onclick = (e) => {
+    const b = e.target.closest('[data-cal]');
+    if (!b) return;
+    const v = b.dataset.v;
+    switch (b.dataset.cal) {
+      case 'tab': cal.tab = v; break;
+      case 'year': cal.year += Number(v); break;
+      case 'pick': state.month = v; cal.tab = 'month'; cal.day = null; render(); break;
+      case 'month': state.month = addMonths(state.month, Number(v)); cal.day = null; cal.year = Number(state.month.slice(0, 4)); render(); break;
+      case 'day': cal.day = cal.day === v ? null : v; break;
+      case 'today': state.month = monthKey(today); cal.day = today; cal.year = Number(today.slice(0, 4)); render(); break;
+      case 'plan': closeSheet(); location.hash = '#budget'; return;
+      default: return;
+    }
+    paintCalendar();
+  };
+}
+
+function dayDetails(iso) {
+  const cats = catById();
+  const txs = liveTx().filter((t) => t.date === iso).sort(byDateDesc);
+  const plan = state.data.bills.filter((b) => b.month === iso.slice(0, 7) && b.day && dateInMonth(b.month, b.day) === iso);
+  return `<h3 class="copy-h">${esc(dayLabelPL(iso))}</h3>
+    ${plan.length ? `<div class="list">${plan.map(planRow).join('')}</div>` : ''}
+    ${txs.length ? `<div class="list" style="margin-top:8px">${txs.map((t) => txRow(t, cats)).join('')}</div>` : ''}
+    ${!plan.length && !txs.length ? '<p class="small muted">Nic tego dnia.</p>' : ''}`;
+}
+
+// ---------- Plany: Do kupienia · Analiza · Asystent AI ----------
+const ai = { history: [], busy: false, error: '' };
+
+function viewPlans() {
+  const tab = state.plansTab || 'buy';
+  const t = (id, label) => `<button type="button" data-action="plans-tab" data-tab2="${id}" aria-pressed="${tab === id}">${label}</button>`;
+  const body = tab === 'analysis' ? viewAnalytics() : tab === 'ai' ? viewAI() : viewPurchases();
+  return `<div class="seg plans-seg">${t('buy', '🛒 Do kupienia')}${t('analysis', '📊 Analiza')}${t('ai', '✨ AI')}</div>${body}`;
+}
+
+function purchaseContext(p) {
+  const txs = liveTx();
+  const bal = balances(state.data.accounts, txs);
+  const savings = state.data.accounts.filter((a) => !a.archived && accountGroup(a) === 'savings' && a.currency === 'PLN');
+  const avg = averages(txs, addMonths(monthKey(todayISO()), -1), 3);
+  const linked = p.accountId ? state.data.accounts.find((a) => a.id === p.accountId) : null;
+  return {
+    saved: linked ? bal[linked.id] : (p.savedManual || 0),
+    savedSource: linked ? linked.name : 'wpisane ręcznie',
+    avgNet: avg.net, avgExpense: avg.expense, avgIncome: avg.income, avgMonths: avg.months,
+    savingsTotal: savings.reduce((s, a) => s + bal[a.id], 0),
+    currentYm: monthKey(todayISO()),
+  };
+}
+
+function viewPurchases() {
+  const showBought = state.buyFilter === 'bought';
+  const prio = { high: 0, mid: 1, low: 2 };
+  const list = state.data.purchases
+    .filter((p) => (showBought ? p.status === 'bought' : p.status !== 'bought'))
+    .sort((a, b) => (prio[a.priority] ?? 1) - (prio[b.priority] ?? 1) || (a.targetYm || '9999').localeCompare(b.targetYm || '9999'));
+  const active = state.data.purchases.filter((p) => p.status !== 'bought');
+  let totalPrice = 0; let totalSaved = 0;
+  for (const p of active) { const a = analyzePurchase(p, purchaseContext(p)); totalPrice += a.price; totalSaved += a.saved; }
+  const chip = (id, label) => `<button class="chip" data-action="buy-filter" data-f="${id}" aria-pressed="${(state.buyFilter || 'active') === id}">${label}</button>`;
+  return `${active.length ? `<section class="card"><h2>Plany zakupów</h2><div class="stat-row">
+      <div class="stat"><small>Razem</small><b>${money(totalPrice)}</b></div>
+      <div class="stat"><small>Zgromadzone</small><b class="pos">${money(totalSaved)}</b></div>
+      <div class="stat"><small>Brakuje</small><b>${money(totalPrice - totalSaved)}</b></div></div></section>` : ''}
+    <div class="chips">${chip('active', 'Planowane')}${chip('bought', 'Kupione')}</div>
+    ${list.length ? list.map(purchaseCard).join('') : `<div class="empty"><span class="em">🛒</span>${showBought ? 'Nic jeszcze nie kupiono.' : 'Dodaj większy zakup: auto, fotowoltaikę, remont…'}</div>`}
+    <button class="btn primary block" data-action="add-purchase">+ Dodaj do kupienia</button>`;
+}
+
+function purchaseCard(p) {
+  const a = analyzePurchase(p, purchaseContext(p));
+  let when = '';
+  if (p.status === 'bought') when = `Kupione${p.boughtAt ? ' ' + esc(formatDatePL(p.boughtAt.slice(0, 10))) : ''}`;
+  else if (a.missing === 0) when = '<span class="pos">Masz już całą kwotę</span>';
+  else if (p.targetYm) when = `Cel: ${esc(monthNamePL(p.targetYm).toLowerCase())} · potrzeba <span class="num">${esc(formatMoney(a.requiredMonthly || 0))}</span>/mies. ${a.onTrack ? '<span class="pos">✓ realne</span>' : '<span class="neg">⚠ za mało</span>'}`;
+  else if (a.affordYm) when = `Szacunkowo: ${esc(monthNamePL(a.affordYm).toLowerCase())}`;
+  else when = '<span class="muted">Brak nadwyżki do oszacowania terminu</span>';
+  return `<section class="acard" data-lp="buy:${esc(p.id)}">
+    <button class="acard-head" data-action="purchase-detail" data-id="${esc(p.id)}">
+      <span class="ico">${esc(p.icon || '🛒')}</span>
+      <span class="mid"><span class="t1">${esc(p.name)} <span class="badge prio-${esc(p.priority || 'mid')}">${esc(PRIORITIES[p.priority] || 'Średni')}</span></span>
+      <span class="t2">${esc(STATUSES[p.status] || 'Pomysł')}${p.notes ? ' · ' + esc(p.notes) : ''}</span></span>
+      <span class="amt num">${esc(formatMoney(a.price))}</span>
+    </button>
+    <div class="track"><div class="fill" style="width:${(a.progress * 100).toFixed(1)}%"></div></div>
+    <div class="small muted" style="margin-top:6px"><span class="num">${esc(formatMoney(a.saved))}</span> z <span class="num">${esc(formatMoney(a.price))}</span> (${Math.round(a.progress * 100)}%) · ${when}</div>
+  </section>`;
+}
+
+function openPurchaseDetail(id) {
+  const p = state.data.purchases.find((x) => x.id === id);
+  if (!p) return;
+  const c = purchaseContext(p);
+  const a = analyzePurchase(p, c);
+  const m = (v) => `<b class="num">${esc(formatMoney(v))}</b>`;
+  const months = (n) => (n == null ? '—' : n === 0 ? 'teraz' : `${n} mies.`);
+  const facts = [
+    ['Cena', m(a.price)],
+    [`Zgromadzone (${esc(c.savedSource)})`, m(a.saved)],
+    ['Brakuje', m(a.missing)],
+    [`Średnia nadwyżka (${c.avgMonths || 0} ost. mies.)`, c.avgMonths ? m(c.avgNet) : 'brak danych'],
+    ['Średnie wydatki miesięczne', c.avgMonths ? m(c.avgExpense) : 'brak danych'],
+    ['Wszystkie oszczędności', m(c.savingsTotal)],
+  ];
+  const est = [];
+  if (a.missing > 0) {
+    est.push(['Kiedy Cię stać', a.affordYm ? `<b>${esc(monthNamePL(a.affordYm))}</b> (${months(a.monthsToAfford)})` : 'nie da się oszacować — brak nadwyżki']);
+  }
+  if (p.targetYm) {
+    est.push([`Do terminu (${esc(monthNamePL(p.targetYm).toLowerCase())})`, a.monthsToTarget > 0 ? `${a.monthsToTarget} mies.` : 'termin minął']);
+    if (a.missing > 0) est.push(['Potrzebna wpłata miesięcznie', a.requiredMonthly ? `${m(a.requiredMonthly)} ${a.onTrack ? '<span class="pos">✓ realne przy obecnym tempie</span>' : '<span class="neg">⚠ więcej niż obecne tempo</span>'}` : '—']);
+  }
+  if (a.cushionBefore != null) {
+    est.push(['Poduszka bezpieczeństwa', `${dec1(a.cushionBefore)} → <b class="${a.cushionAfter < 3 ? 'neg' : ''}">${dec1(a.cushionAfter)}</b> mies. wydatków po zakupie za gotówkę`]);
+  }
+  if (a.loan) {
+    est.push(['Kredyt: rata', m(a.loan.installment) + (a.loan.incomeShare != null ? ` (${Math.round(a.loan.incomeShare * 100)}% średniego dochodu)` : '')]);
+    est.push(['Kredyt: odsetki łącznie', m(a.loan.interest)]);
+    est.push(['Kredyt: całkowity koszt', m(a.loan.total + (p.loanOwn || 0))]);
+  }
+  if (a.payback) est.push(['Zwrot inwestycji', `ok. <b>${dec1(a.payback.years)} lat</b> (${a.payback.months} mies.)`]);
+  const assumptions = [
+    a.paceSource === 'plan' ? `Tempo odkładania: Twoja planowana wpłata ${formatMoney(p.monthlySaving)}/mies.` : a.paceSource === 'average' ? `Tempo odkładania: średnia nadwyżka z ostatnich ${c.avgMonths} mies. (${formatMoney(a.pace)}/mies.), zakładając, że się utrzyma.` : 'Brak dodatniej nadwyżki — terminu nie da się oszacować.',
+    a.loan ? `Kredyt: rata równa, ${String(p.loanRate).replace('.', ',')}% rocznie, ${p.loanMonths} mies., wkład własny ${formatMoney(p.loanOwn || 0)}; bez prowizji i ubezpieczeń.` : '',
+    a.payback ? `Zwrot: stała korzyść ${formatMoney(p.monthlyBenefit)}/mies., bez inflacji, zmian cen i kosztów serwisu.` : '',
+    'Ceny i stopy procentowe mogą się zmienić — to szacunek, nie gwarancja.',
+  ].filter(Boolean);
+  const rows = (list) => `<ul class="menu kv">${list.map(([k, v]) => `<li><div><span>${k}</span><span>${v}</span></div></li>`).join('')}</ul>`;
+  openSheet(`${p.icon || '🛒'} ${p.name}`, `
+    <div class="track" style="margin:4px 0 6px"><div class="fill" style="width:${(a.progress * 100).toFixed(1)}%"></div></div>
+    <p class="small muted" style="margin:0 0 8px">${Math.round(a.progress * 100)}% · ${esc(STATUSES[p.status] || '')} · priorytet ${esc((PRIORITIES[p.priority] || '').toLowerCase())}</p>
+    <h3 class="copy-h">📌 Dane rzeczywiste</h3>${rows(facts)}
+    ${est.length ? `<h3 class="copy-h">📈 Szacunki</h3>${rows(est)}` : ''}
+    <h3 class="copy-h">⚙️ Założenia</h3><ul class="small muted assump">${assumptions.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
+    ${p.notes ? `<p class="note">${esc(p.notes)}</p>` : ''}
+    <div class="actions">
+      <button class="btn primary block" data-action="ai-purchase" data-id="${esc(p.id)}">✨ Zapytaj AI o ten zakup</button>
+      <div class="grid2"><button class="btn" data-action="edit-purchase" data-id="${esc(p.id)}">Edytuj</button>
+      <button class="btn" data-action="buy-done" data-id="${esc(p.id)}" data-close="1">${p.status === 'bought' ? 'Przywróć do planów' : 'Kupione ✓'}</button></div>
+    </div>`);
+}
+
+function openPurchaseSheet(id) {
+  const p = id ? state.data.purchases.find((x) => x.id === id) : null;
+  let icon = p?.icon || PURCHASE_ICONS[0];
+  let priority = p?.priority || 'mid';
+  let status = p?.status || 'idea';
+  const savingsAccs = state.data.accounts.filter((a) => !a.archived && accountGroup(a) === 'savings');
+  const mi = (v) => (v ? esc(minorToInput(v)) : '');
+  const seg = (name, items, cur) => `<div class="seg" data-seg="${name}">${Object.entries(items).map(([k, v]) => `<button type="button" data-v="${k}" aria-pressed="${k === cur}">${esc(v)}</button>`).join('')}</div>`;
+  openSheet(p ? 'Edytuj zakup' : 'Do kupienia', `
+    <label class="field"><span>Co chcesz kupić</span><input id="pu-name" maxlength="60" value="${esc(p?.name || '')}" placeholder="np. Auto, Fotowoltaika, Kuchnia"></label>
+    <div class="field"><span>Ikona</span><div class="icongrid" id="pu-icons">${PURCHASE_ICONS.map((i) => `<button type="button" data-icon="${i}" aria-pressed="${i === icon}">${i}</button>`).join('')}</div></div>
+    <label class="field"><span>Cena</span><input id="pu-price" class="amount-input" inputmode="decimal" placeholder="0,00" value="${mi(p?.price)}"></label>
+    <div class="field"><span>Priorytet</span>${seg('prio', PRIORITIES, priority)}</div>
+    <div class="field"><span>Status</span>${seg('status', STATUSES, status)}</div>
+    <div class="grid2">
+      <label class="field"><span>Planowany termin</span><input id="pu-target" type="month" value="${esc(p?.targetYm || '')}"></label>
+      <label class="field"><span>Odkładam miesięcznie</span><input id="pu-monthly" inputmode="decimal" placeholder="opcjonalnie" value="${mi(p?.monthlySaving)}"></label>
+    </div>
+    <label class="field"><span>Skąd liczyć zgromadzone pieniądze</span><select id="pu-acc">
+      <option value="">Wpiszę ręcznie</option>
+      ${savingsAccs.map((a) => `<option value="${esc(a.id)}" ${p?.accountId === a.id ? 'selected' : ''}>Konto: ${esc(a.name)}</option>`).join('')}</select></label>
+    <label class="field" id="pu-saved-wrap"><span>Zgromadzone</span><input id="pu-saved" inputmode="decimal" placeholder="0,00" value="${mi(p?.savedManual)}"></label>
+    <details class="more" ${p?.loanMonths ? 'open' : ''}><summary>Porównanie z kredytem / leasingiem</summary>
+      <div class="grid2">
+        <label class="field"><span>Oprocentowanie % rocznie</span><input id="pu-rate" inputmode="decimal" placeholder="np. 9,5" value="${p?.loanRate != null ? esc(String(p.loanRate).replace('.', ',')) : ''}"></label>
+        <label class="field"><span>Okres (miesiące)</span><input id="pu-months" type="number" inputmode="numeric" placeholder="np. 60" value="${p?.loanMonths || ''}"></label>
+      </div>
+      <label class="field"><span>Wkład własny</span><input id="pu-own" inputmode="decimal" placeholder="0,00" value="${mi(p?.loanOwn)}"></label>
+    </details>
+    <details class="more" ${p?.monthlyBenefit ? 'open' : ''}><summary>Inwestycja, która się zwraca (np. fotowoltaika)</summary>
+      <label class="field"><span>Miesięczna oszczędność / zysk</span><input id="pu-benefit" inputmode="decimal" placeholder="np. 350" value="${mi(p?.monthlyBenefit)}"></label>
+    </details>
+    <label class="field"><span>Notatki</span><input id="pu-notes" maxlength="200" value="${esc(p?.notes || '')}" placeholder="np. oferty, model, link"></label>
+    <div class="err" id="pu-err" role="alert"></div>
+    <div class="actions ${p ? 'two' : ''}">${p ? '<button class="btn danger" id="pu-del">Usuń</button>' : ''}<button class="btn primary block" id="pu-save">Zapisz</button></div>`);
+  const sheet = $('#sheet');
+  const paintSaved = () => { $('#pu-saved-wrap').hidden = !!$('#pu-acc').value; };
+  paintSaved();
+  $('#pu-acc').onchange = paintSaved;
+  $('#pu-icons').onclick = (e) => {
+    const x = e.target.closest('[data-icon]');
+    if (!x) return;
+    icon = x.dataset.icon;
+    sheet.querySelectorAll('#pu-icons [data-icon]').forEach((y) => y.setAttribute('aria-pressed', String(y === x)));
+  };
+  sheet.querySelectorAll('[data-seg]').forEach((sg) => {
+    sg.onclick = (e) => {
+      const x = e.target.closest('[data-v]');
+      if (!x) return;
+      if (sg.dataset.seg === 'prio') priority = x.dataset.v; else status = x.dataset.v;
+      sg.querySelectorAll('[data-v]').forEach((y) => y.setAttribute('aria-pressed', String(y === x)));
+    };
+  });
+  const optMoney = (sel) => ($(sel).value.trim() ? toMinor($(sel).value) : null);
+  $('#pu-save').onclick = async () => {
+    const rateRaw = $('#pu-rate').value.trim().replace(',', '.');
+    const monthsRaw = $('#pu-months').value.trim();
+    const item = {
+      ...(p || { id: db.newId('buy'), createdAt: new Date().toISOString() }),
+      name: $('#pu-name').value.trim(), icon, priority, status,
+      price: toMinor($('#pu-price').value),
+      targetYm: $('#pu-target').value || null,
+      monthlySaving: optMoney('#pu-monthly'),
+      accountId: $('#pu-acc').value || null,
+      savedManual: $('#pu-acc').value ? null : optMoney('#pu-saved'),
+      loanRate: rateRaw ? Number(rateRaw) : null,
+      loanMonths: monthsRaw ? Number(monthsRaw) : null,
+      loanOwn: optMoney('#pu-own'),
+      monthlyBenefit: optMoney('#pu-benefit'),
+      notes: $('#pu-notes').value.trim(),
+      updatedAt: new Date().toISOString(),
+    };
+    if (status === 'bought' && !item.boughtAt) item.boughtAt = new Date().toISOString();
+    if (status !== 'bought') item.boughtAt = null;
+    const errors = validatePurchase(item);
+    if (item.loanRate != null && !item.loanMonths) errors.push('Podaj okres kredytu w miesiącach');
+    if (errors.length) { $('#pu-err').textContent = errors.join(' · '); return; }
+    await db.put('purchases', item);
+    closeSheet();
+    await reload();
+    toast('Zapisano');
+  };
+  if (p) $('#pu-del').onclick = () => { closeSheet(); deletePurchase(p.id); };
+}
+
+async function deletePurchase(id) {
+  const p = state.data.purchases.find((x) => x.id === id);
+  if (!p) return;
+  await db.remove('purchases', id);
+  await reload();
+  toast(`Usunięto: ${p.name}`, { label: 'Cofnij', run: async () => { await db.put('purchases', p); await reload(); } });
+}
+
+async function togglePurchaseBought(id) {
+  const p = state.data.purchases.find((x) => x.id === id);
+  if (!p) return;
+  const bought = p.status !== 'bought';
+  await db.put('purchases', { ...p, status: bought ? 'bought' : 'saving', boughtAt: bought ? new Date().toISOString() : null });
+  await reload();
+  toast(bought ? `Kupione: ${p.name} 🎉 — dodaj wydatek przyciskiem +, jeśli chcesz go mieć w transakcjach` : 'Przywrócono do planów');
+}
+
+// ---------- Asystent AI ----------
+const AI_EXAMPLES = [
+  'Dlaczego wydaliśmy więcej niż w poprzednim miesiącu?',
+  'Ile średnio kosztuje nas utrzymanie domu?',
+  'Jak zmieniły się nasze wydatki w ciągu pół roku?',
+  'Ile możemy odkładać miesięcznie przy obecnych dochodach?',
+  'Jakie wydatki najbardziej wzrosły?',
+  'Zasymuluj nasz majątek za 15 lat, jeśli będziemy odkładać obecną nadwyżkę przy 5% rocznie i 3% inflacji.',
+];
+
+const aiKey = () => getPref('sf-gemini-key', '');
+const aiModel = () => getPref('sf-gemini-model', '') || DEFAULT_MODEL;
+
+function currentAIContext() {
+  const analysis = {};
+  for (const p of state.data.purchases) analysis[p.id] = analyzePurchase(p, purchaseContext(p));
+  return buildAIContext(state.data, state.month, { purchases: state.data.purchases, purchaseAnalysis: analysis });
+}
+
+function viewAI() {
+  if (!aiKey()) {
+    return `<section class="card"><h2>Asystent AI (Gemini)</h2>
+      <p class="small">Zadawaj pytania o swoje finanse. Aplikacja sama liczy sumy i średnie, a do Gemini wysyła tylko te zagregowane liczby — bez opisów transakcji i nazw kont.</p>
+      <p class="small">Potrzebny jest Twój klucz API z Google AI Studio. Zostanie zapisany tylko w tym telefonie (nie ma go na GitHubie ani w kopii zapasowej).</p>
+      <a class="btn primary block" href="#settings" style="display:grid;place-items:center;text-decoration:none">Wpisz klucz w Ustawieniach</a></section>`;
+  }
+  const msgs = ai.history.map((m) => (m.role === 'user'
+    ? `<div class="msg user">${esc(m.text)}</div>`
+    : `<div class="msg ai">${renderAIText(m.text)}</div>`)).join('');
+  return `<p class="small muted" style="margin:10px 4px">Miesiąc analizy: <b>${esc(monthNamePL(state.month))}</b>. Liczby liczy aplikacja, AI je interpretuje.</p>
+    ${!ai.history.length ? `<div class="chips wrap">${AI_EXAMPLES.map((q, i) => `<button class="chip" data-action="ai-example" data-i="${i}">${esc(q)}</button>`).join('')}</div>` : ''}
+    <div class="chat">${msgs}${ai.busy ? '<div class="msg ai typing">Analizuję…</div>' : ''}</div>
+    ${ai.error ? `<div class="note warn">${esc(ai.error)}</div>` : ''}
+    <div class="ask"><textarea id="ai-q" rows="2" maxlength="600" placeholder="Zapytaj o swoje finanse…" ${ai.busy ? 'disabled' : ''}></textarea>
+      <button class="btn primary" data-action="ai-send" ${ai.busy ? 'disabled' : ''}>Wyślij</button></div>
+    <div class="actions two">
+      <button class="btn" data-action="ai-clear" ${ai.history.length ? '' : 'disabled'}>Wyczyść rozmowę</button>
+      <button class="btn" data-action="ai-data">Co wysyłam do AI?</button>
+    </div>`;
+}
+
+async function askAI(question) {
+  question = (question || '').trim();
+  if (!question || ai.busy) return;
+  ai.error = '';
+  ai.busy = true;
+  const history = ai.history.slice();
+  ai.history.push({ role: 'user', text: question });
+  if (state.view === 'plans') render();
+  try {
+    const text = await askGemini({ key: aiKey(), model: aiModel(), question, context: currentAIContext(), history });
+    ai.history.push({ role: 'ai', text });
+  } catch (err) {
+    ai.error = err.message;
+  } finally {
+    ai.busy = false;
+    if (state.view === 'plans' && state.plansTab === 'ai') { render(); window.scrollTo(0, document.body.scrollHeight); }
+  }
+}
+
+function showAIData() {
+  openSheet('Co wysyłam do AI', `<p class="small muted" style="margin-top:0">Dokładnie te dane (kwoty w złotych) dołączane są do każdego pytania. Bez opisów transakcji, nazw kont i numerów.</p>
+    <pre class="json">${esc(JSON.stringify(currentAIContext(), null, 2))}</pre>`);
+}
+
 // ---------- Ustawienia ----------
 function getPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -746,7 +1261,17 @@ function viewSettings() {
           ${accOpts.map((a) => `<option value="${esc(a.id)}" ${state.prefs.defaultAccount === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
         </select></div>
       <div class="row-set"><span>Wibracja przy przytrzymaniu</span>${sw('set-vibrate', getPref('sf-vibrate', '1') === '1', 'vibrate-toggle')}</div>
+      <div class="row-set"><span>Odhaczenie ✓ w planie dodaje transakcję<span class="sub">Wpływ → przychód, opłata → wydatek. Odznaczenie usuwa ją do kosza</span></span>${sw('set-autotx', getPref('sf-autotx', '1') === '1', 'autotx-toggle')}</div>
       <p class="small muted" style="margin:8px 0 0">💡 Przytrzymaj kafelek (transakcję, rachunek, konto, kartę na stronie startowej), żeby zobaczyć więcej opcji.</p>
+    </section>
+    <section class="card"><h2>Asystent AI (Gemini)</h2>
+      ${aiKey() ? `<p class="small">Klucz zapisany w tym telefonie: <b>••••${esc(aiKey().slice(-4))}</b></p>` : '<p class="small muted">Klucz utworzysz w Google AI Studio (aistudio.google.com → Get API key). Najlepiej osobny klucz tylko do tej aplikacji.</p>'}
+      <label class="field"><span>${aiKey() ? 'Zmień klucz' : 'Klucz API'}</span><input id="set-ai-key" type="password" autocomplete="off" spellcheck="false" placeholder="${aiKey() ? 'zostaw puste, żeby nie zmieniać' : 'wklej klucz'}"></label>
+      <label class="field"><span>Model</span><input id="set-ai-model" autocomplete="off" spellcheck="false" value="${esc(aiModel())}"></label>
+      <div class="actions two" style="grid-template-columns:1fr 1fr"><button class="btn" data-action="ai-key-check">Sprawdź</button><button class="btn primary" data-action="ai-key-save">Zapisz</button></div>
+      <p id="ai-key-status" class="small muted"></p>
+      ${aiKey() ? '<button class="btn danger block" data-action="ai-key-delete">Usuń klucz z telefonu</button>' : ''}
+      <p class="small muted">Klucz jest tylko w tym telefonie — nie ma go na GitHubie ani w kopii zapasowej. Do Gemini trafiają wyłącznie zagregowane sumy (podgląd: Plany → AI → „Co wysyłam do AI?”).</p>
     </section>
     <section class="card"><h2>Kategorie</h2><ul class="menu">
       <li><button data-action="categories" data-kind="expense"><span>Kategorie wydatków<span class="sub">${state.data.categories.filter((c) => c.kind === 'expense' && !c.archived).length} aktywnych</span></span>›</button></li>
@@ -870,13 +1395,26 @@ function openContextMenu(spec) {
     const b = state.data.bills.find((x) => x.id === id);
     if (!b) return;
     title = `${b.icon || ''} ${b.name}`;
-    head = `<span class="num">${esc(formatMoney(b.amount))}</span> · ${b.paid ? 'zapłacone' : 'niezapłacone'}`;
+    const inc = kindOf(b) === 'income';
+    head = `${inc ? 'Wpływ' : 'Do zapłaty'} · <span class="num">${esc(formatMoney(b.amount))}</span> · ${b.paid ? (inc ? 'wpłynęło' : 'zapłacone') : (inc ? 'jeszcze nie wpłynęło' : 'niezapłacone')}`;
     items = [
-      item('toggle-bill', b.paid ? '✕' : '✓', b.paid ? 'Oznacz jako niezapłacone' : 'Oznacz jako zapłacone'),
+      item('toggle-bill', b.paid ? '✕' : '✓', b.paid ? (inc ? 'Oznacz: jeszcze nie wpłynęło' : 'Oznacz jako niezapłacone') : (inc ? 'Oznacz: wpłynęło' : 'Oznacz jako zapłacone')),
       item('edit-bill', '✏️', 'Edytuj', { close: false }),
       item('bill-next', '➡️', `Skopiuj na ${monthNamePL(addMonths(b.month, 1)).toLowerCase()}`),
       item('dup-bill', '📄', 'Duplikuj w tym miesiącu'),
       item('del-bill', '🗑️', 'Usuń', { danger: true }),
+    ];
+  } else if (kind === 'buy') {
+    const p = state.data.purchases.find((x) => x.id === id);
+    if (!p) return;
+    title = `${p.icon || '🛒'} ${p.name}`;
+    head = `<span class="num">${esc(formatMoney(p.price))}</span> · ${esc(STATUSES[p.status] || '')}`;
+    items = [
+      item('purchase-detail', '📈', 'Analiza', { close: false }),
+      item('edit-purchase', '✏️', 'Edytuj', { close: false }),
+      item('ai-purchase', '✨', 'Zapytaj AI o ten zakup'),
+      item('buy-done', p.status === 'bought' ? '↩️' : '✓', p.status === 'bought' ? 'Przywróć do planów' : 'Oznacz jako kupione'),
+      item('del-purchase', '🗑️', 'Usuń', { danger: true }),
     ];
   } else if (kind === 'acc') {
     const a = accById()[id];
@@ -930,9 +1468,9 @@ async function deleteTx(id) {
 async function copyBillTo(id, month) {
   const b = state.data.bills.find((x) => x.id === id);
   if (!b) return;
-  const exists = state.data.bills.some((x) => x.month === month && x.name.trim().toLowerCase() === b.name.trim().toLowerCase());
+  const exists = state.data.bills.some((x) => x.month === month && kindOf(x) === kindOf(b) && x.name.trim().toLowerCase() === b.name.trim().toLowerCase());
   if (exists && month !== b.month) { toast(`„${b.name}” już jest na liście: ${monthNamePL(month).toLowerCase()}`); return; }
-  await db.put('bills', { ...b, id: db.newId('bill'), month, paid: false, paidAt: null, createdAt: new Date().toISOString(), order: Date.now() });
+  await db.put('bills', { ...b, id: db.newId('bill'), month, paid: false, paidAt: null, txId: null, createdAt: new Date().toISOString(), order: Date.now() });
   await reload();
   toast(month === b.month ? 'Zduplikowano' : `Skopiowano na ${monthNamePL(month).toLowerCase()}`);
 }
@@ -1163,7 +1701,7 @@ async function openTxSheet(id, opts = {}) {
     quick.oninput = apply;
     if (opts.quick) { quick.value = opts.quick; apply(); }
     quick.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); apply(); $('#t-save').click(); } };
-    setTimeout(() => quick.focus(), 50);
+    focusLater('#t-quick');
   }
 
   $('#t-save').onclick = async () => {
@@ -1316,12 +1854,67 @@ async function onAction(e) {
     case 'close-sheet': closeSheet(); break;
     case 'month-prev': state.month = addMonths(state.month, -1); render(); break;
     case 'month-next': state.month = addMonths(state.month, 1); render(); break;
-    case 'month-today': state.month = monthKey(todayISO()); render(); break;
+    case 'month-today': openCalendar(); break;
     case 'tx-filter': state.txFilter = el.dataset.f; render(); break;
-    case 'add-bill': openBillSheet(null); break;
+    case 'add-bill': openBillSheet(null, el.dataset.kind); break;
     case 'edit-bill': openBillSheet(el.dataset.id); break;
     case 'toggle-bill': toggleBill(el.dataset.id); break;
-    case 'copy-bills': copyBills(); break;
+    case 'copy-bills': openCopySheet(); break;
+    case 'plans-tab':
+      state.plansTab = el.dataset.tab2;
+      if (state.view !== 'plans') location.hash = '#plans'; else render();
+      break;
+    case 'buy-filter': state.buyFilter = el.dataset.f; render(); break;
+    case 'add-purchase': openPurchaseSheet(null); break;
+    case 'edit-purchase': openPurchaseSheet(el.dataset.id); break;
+    case 'purchase-detail': openPurchaseDetail(el.dataset.id); break;
+    case 'buy-done': togglePurchaseBought(el.dataset.id); break;
+    case 'del-purchase': deletePurchase(el.dataset.id); break;
+    case 'ai-purchase': {
+      const p = state.data.purchases.find((x) => x.id === el.dataset.id);
+      if (!p) break;
+      if ($('#sheet').open) closeSheet();
+      state.plansTab = 'ai';
+      if (state.view !== 'plans') location.hash = '#plans'; else render();
+      if (aiKey()) askAI(`Oceń mój plan zakupu: ${p.name} za ${formatMoney(p.price)}. Kiedy realnie mnie na to stać, jak wpłynie na poduszkę bezpieczeństwa i czy lepiej gotówka czy kredyt (jeśli podałem warunki)?`);
+      break;
+    }
+    case 'ai-example': askAI(AI_EXAMPLES[Number(el.dataset.i)]); break;
+    case 'ai-send': { const q = $('#ai-q'); if (q && q.value.trim()) askAI(q.value); break; }
+    case 'ai-clear': ai.history = []; ai.error = ''; render(); break;
+    case 'ai-data': showAIData(); break;
+    case 'autotx-toggle': setPref('sf-autotx', el.checked ? '1' : '0'); break;
+    case 'ai-key-save': {
+      const k = $('#set-ai-key').value.trim();
+      const m = $('#set-ai-model').value.trim();
+      if (k) setPref('sf-gemini-key', k);
+      setPref('sf-gemini-model', m && m !== DEFAULT_MODEL ? m : '');
+      render();
+      toast(k ? 'Zapisano klucz w tym telefonie' : 'Zapisano model');
+      break;
+    }
+    case 'ai-key-check': {
+      const k = $('#set-ai-key').value.trim() || aiKey();
+      const m = $('#set-ai-model').value.trim() || DEFAULT_MODEL;
+      const out = $('#ai-key-status');
+      out.textContent = 'Sprawdzam…';
+      out.className = 'small muted';
+      try {
+        const name = await checkGeminiKey(k, m);
+        out.textContent = `✓ Działa: ${name}`;
+        out.className = 'small pos';
+      } catch (err) {
+        out.textContent = '✕ ' + err.message;
+        out.className = 'small neg';
+      }
+      break;
+    }
+    case 'ai-key-delete':
+      setPref('sf-gemini-key', '');
+      ai.history = [];
+      render();
+      toast('Usunięto klucz z telefonu');
+      break;
     case 'edit-account': openAccountSheet(el.dataset.id); break;
     case 'add-account': openAccountSheet(null, el.dataset.group); break;
     case 'account-detail': openAccountDetail(el.dataset.id); break;
@@ -1454,6 +2047,8 @@ async function init() {
   window.addEventListener('popstate', onPopState);
   $('#sheet').addEventListener('click', (e) => { if (e.target.id === 'sheet') closeSheet(); }); // klik w tło
   $('#sheet').addEventListener('cancel', (e) => { e.preventDefault(); closeSheet(); });
+  // zamknięte okienko czyścimy, żeby jego stara treść nie dublowała przycisków i pól
+  $('#sheet').addEventListener('close', () => { setTimeout(() => { const sh = $('#sheet'); if (!sh.open) sh.innerHTML = ''; }, 0); });
   $('#file-input').addEventListener('change', (e) => {
     const file = e.target.files[0];
     e.target.value = '';
@@ -1461,6 +2056,7 @@ async function init() {
   });
   try {
     await db.ensureDefaults();
+    await db.migrate();
     state.lastBackup = await db.getSetting('lastBackup', null);
     state.layout = normalizeLayout(await db.getSetting('dashLayout', null));
     state.prefs.defaultAccount = await db.getSetting('defaultAccount', '') || '';

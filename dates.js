@@ -53,3 +53,16 @@ export function dayLabelPL(iso, today = todayISO()) {
   const wd = WEEKDAYS[new Date(y, m - 1, d).getDay()];
   return `${wd.charAt(0).toUpperCase() + wd.slice(1)}, ${formatDatePL(iso)}`;
 }
+
+export function daysInMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return new Date(y, m, 0).getDate();
+}
+
+/** Dzień miesiąca jako data ISO, przycięty do długości miesiąca (31 → 28/29/30). */
+export function dateInMonth(ym, day) {
+  const d = Math.min(Math.max(1, Number(day) || 1), daysInMonth(ym));
+  return `${ym}-${pad(d)}`;
+}
+
+export const WEEKDAYS_SHORT = ['pn', 'wt', 'śr', 'cz', 'pt', 'so', 'nd'];

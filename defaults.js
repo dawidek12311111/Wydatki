@@ -4,7 +4,9 @@ export const DEFAULT_CATEGORIES = [
   // przychody
   { id: 'inc-salary', name: 'Wynagrodzenie', kind: 'income', icon: '💼', keywords: ['wypłata', 'wyplata', 'pensja', 'wynagrodzenie'] },
   { id: 'inc-bonus', name: 'Premie i nadgodziny', kind: 'income', icon: '⭐', keywords: ['premia', 'nadgodziny', 'bonus'] },
-  { id: 'inc-other', name: 'Inne przychody', kind: 'income', icon: '➕', keywords: ['sprzedaż', 'sprzedaz', 'olx', 'zwrot podatku'] },
+  { id: 'inc-benefits', name: 'Świadczenia (800+)', kind: 'income', icon: '👶', keywords: ['800+', '800', 'świadczenie', 'swiadczenie', 'zus', 'zasiłek', 'zasilek'], since: 2 },
+  { id: 'inc-tax', name: 'Zwrot podatku', kind: 'income', icon: '🧾', keywords: ['pit', 'zwrot podatku', 'urząd skarbowy'], since: 2 },
+  { id: 'inc-other', name: 'Inne przychody', kind: 'income', icon: '➕', keywords: ['sprzedaż', 'sprzedaz', 'olx', 'vinted'] },
   // wydatki
   { id: 'exp-home', name: 'Mieszkanie', kind: 'expense', icon: '🏠', keywords: ['czynsz', 'najem', 'wspólnota', 'kredyt hipoteczny'] },
   { id: 'exp-bills', name: 'Rachunki', kind: 'expense', icon: '💡', keywords: ['prąd', 'prad', 'gaz', 'woda', 'internet', 'telefon', 'abonament'] },
