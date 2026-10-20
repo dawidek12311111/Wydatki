@@ -2,6 +2,7 @@
 // Zasada: „wpłacony kapitał” liczymy z salda początkowego i transakcji (wpłaty/wypłaty),
 // a zmianę wartości rynkowej trzymamy osobno, żeby wpłata nie wyglądała jak zysk.
 import { effectOnAccount, isLive } from './calc.js';
+import { termDeposit, isTermDeposit } from './deposit.js';
 
 export const TROY_OUNCE_G = 31.1034768;
 export const METALS = { gold: 'Złoto', silver: 'Srebro' };
@@ -65,7 +66,13 @@ export function accountValue(account, transactions, { asOf = END, prices = null,
     }
     return sum;
   }
-  return bookBalance(account, transactions, asOf) + valuationAdjustment(account, transactions, asOf);
+  const base = bookBalance(account, transactions, asOf) + valuationAdjustment(account, transactions, asOf);
+  // lokata: odsetki netto narosłe do dziś (wypłacane na koniec — tu tylko pokazujemy, ile już „pracuje”)
+  if (isTermDeposit(account) && today !== END && base > 0) {
+    const day = asOf < today ? asOf : today;
+    if (day >= account.startDate) return base + termDeposit({ principal: base, rate: account.rate, months: account.termMonths, startDate: account.startDate, today: day }).accrued;
+  }
+  return base;
 }
 
 /** Wynik inwestycji: wpłacono, wartość, zysk/strata i %. */

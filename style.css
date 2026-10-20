@@ -491,3 +491,19 @@ details.pos[open] .chev { transform: rotate(90deg); }
 .bt-op input[type=checkbox] { width: 22px; height: 22px; flex: none; accent-color: var(--accent); }
 .bt-op .copy-amt { width: 104px; }
 .card h2 > span { display: flex; gap: 4px; align-items: baseline; }
+
+/* v1.0: lokaty, wykres majątku, film */
+.dep { margin: 2px 0 8px; display: grid; gap: 3px; }
+.dep-pay { font-size: 15px; }
+.dep .track { margin-top: 4px; }
+.dep-note .actions.three-btn { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 6px; margin-top: 10px; }
+.dep-note .btn { min-height: 42px; padding: 8px 4px; font-size: 13px; }
+.stat small + b + small { display: block; }
+#film-root:empty { display: none; }
+.film { position: fixed; inset: 0; z-index: 120; background: #0b1412; touch-action: none; }
+.film-cv { display: block; width: 100%; height: 100%; }
+.film-bar { position: absolute; left: 12px; right: 12px; bottom: calc(14px + env(safe-area-inset-bottom)); display: flex; align-items: center; gap: 10px; }
+.film-bar button { width: 44px; height: 44px; border-radius: 50%; border: 0; background: rgba(255,255,255,.16); color: #fff; font-size: 18px; flex: none; }
+.film-prog { flex: 1; height: 5px; border-radius: 9px; background: rgba(255,255,255,.2); overflow: hidden; }
+.film-prog i { display: block; height: 100%; width: 0; background: #fff; }
+.film-replay { position: absolute; left: 50%; bottom: calc(80px + env(safe-area-inset-bottom)); transform: translateX(-50%); border: 0; border-radius: 99px; padding: 14px 22px; background: #fff; color: #0b1412; font-weight: 700; font-size: 16px; }

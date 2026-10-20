@@ -1,6 +1,6 @@
 # Smart Finance
 
-Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.9.0**.
+Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **1.0.0**.
 Dane zapisują się **tylko w Twoim telefonie** — nic nie trafia na serwer.
 
 Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
@@ -35,6 +35,9 @@ Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
 - Złoto i srebro w pozycjach (monety, sztabki, biżuteria…: ilość, próba, cena skupu, koszt) — jedna karta z sumą, rozwijana lista
 - Krypto jako portfel z pozycjami (BTC, ETH…), ceny automatycznie z CoinGecko, wycena ręczna dla reszty
 - Szybka aktualizacja: kilka operacji jednym zdaniem lub głosem („wpłynęła wypłata 9k, ppk 300, na ikze 300, spłata kredytów według planu”) → lista do zatwierdzenia
+- Lokaty i konta oszczędnościowe z oprocentowaniem: „wyciągniesz X zł” po podatku Belki, odsetki narastające w majątku, promocje, przypomnienie o końcu lokaty (wypłać / odnów / później)
+- Wykres majątku w czasie (Majątek + karta na Start): netto, warstwy, 6/12 mies./wszystko, zmiana m/m i r/r; comiesięczne „zdjęcia” majątku
+- 🎬 Film o majątku: 30 s animacji z muzyką i efektami (opcjonalnie lektor) — podsumowanie, historia, analiza, przyszłość
 - Działa offline, instalacja na Androidzie
 
 ## Wdrożenie na GitHub Pages (bez terminala)

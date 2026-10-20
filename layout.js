@@ -11,6 +11,7 @@ export const DASH_CARDS = {
   recent: { label: 'Ostatnie transakcje', icon: '🧾' },
   purchases: { label: 'Do kupienia', icon: '🛒' },
   metals: { label: 'Złoto i srebro', icon: '🥇' },
+  nwchart: { label: 'Majątek w czasie (wykres)', icon: '📈' },
 };
 
 export const DEFAULT_LAYOUT = [
@@ -24,6 +25,7 @@ export const DEFAULT_LAYOUT = [
   { id: 'loans', visible: false },
   { id: 'purchases', visible: false },
   { id: 'metals', visible: false },
+  { id: 'nwchart', visible: false },
 ];
 
 /** Naprawia zapisany układ: usuwa nieznane/zdublowane karty, dopisuje nowe na końcu. */

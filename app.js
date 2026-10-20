@@ -5,7 +5,7 @@ import {
   monthlySeries, categoryChanges, isLive, accountMonth,
 } from './calc.js';
 import { toMinor, formatMoney, minorToInput } from './money.js';
-import { todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, formatDatePL, dateInMonth, WEEKDAYS_SHORT } from './dates.js';
+import { addDays, todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, formatDatePL, dateInMonth, WEEKDAYS_SHORT } from './dates.js';
 import { parseQuick, guessCategory } from './parse.js';
 import { validateTransaction, validateBackup, validateBill, validatePurchase } from './validate.js';
 import { transactionsToCSV } from './csv.js';
@@ -19,11 +19,14 @@ import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS, loanInstallment 
 import { isCrypto, hasPositions, positionsOf, positionsSummary, applyTrade, metalOf, accountValue, bookBalance, investmentResult, valuedNetWorth, applyChange, sortedValuations, metalValue, TROY_OUNCE_G } from './valuation.js';
 import { refreshPrices, fetchCryptoPrices, searchCoins } from './prices.js';
 import { parseBatch } from './batch.js';
+import { termDeposit, savingsEstimate, isTermDeposit, depositsDue, addMonthsDate } from './deposit.js';
+import { netWorthHistory, historyStats, breakdown } from './history.js';
+import { playFilm } from './film.js';
 import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.9.0';
+export const APP_VERSION = '1.0.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -33,6 +36,9 @@ const state = {
   data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
   plansTab: 'buy',
   prices: null,
+  snapshots: {},
+  nwRange: '12',
+  nwLayers: false,
   openPos: {},
   profile: null,
   deletedAccounts: [],
@@ -194,6 +200,7 @@ function viewDashboard() {
   const s = monthSummary(txs, state.month);
   const parts = [];
   const lp = (id) => `data-lp="card:${id}"`;
+  parts.push(depositReminders());
   if (state.profile?.name) parts.push(`<button class="hello link" data-action="profile" style="color:inherit"><span class="av">${profileAvatar()}</span>Cześć, ${esc(state.profile.name)} 👋</button>`);
 
   if (!state.data.transactions.length) {
@@ -245,6 +252,7 @@ function viewDashboard() {
     },
 
     metals: () => metalPricesCard(true),
+    nwchart: () => nwChartCard({ lpAttr: lp('nwchart') }),
 
     purchases: () => {
       const prio = { high: 0, mid: 1, low: 2 };
@@ -672,6 +680,7 @@ function viewWealth() {
       </button>
       ${metal ? `<div class="acard-month small">${positionsOf(a).length > 1 ? metalPriceOnly(a) : metalLine(a)}</div>` : ''}
       ${crypto && positionsOf(a).length ? `<div class="acard-month small">${cryptoLine(a)}</div>` : ''}
+      ${a.rate ? depositLine(a, bookBal[a.id]) : ''}
       ${showGain ? `<div class="acard-month small">Wpłacono <span class="num">${esc(formatMoney(r.paidIn, a.currency))}</span> · ${r.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${r.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(r.gain, a.currency, { sign: true }))}${r.gainPct != null ? ` (${esc(fmtPct(r.gainPct * 100))})` : ''}</b></div>` : ''}
       <div class="acard-month small">${m.inflow || m.outflow ? `W tym miesiącu:${m.inflow ? ` <span class="pos num">wpłaty +${esc(formatMoney(m.inflow, a.currency))}</span>` : ''}${m.inflow && m.outflow ? ' ·' : ''}${m.outflow ? ` <span class="neg num">wypłaty −${esc(formatMoney(m.outflow, a.currency))}</span>` : ''}` : 'Brak wpłat i wypłat w tym miesiącu'}</div>
       ${metal || crypto ? positionsHtml(a) : ''}
@@ -732,6 +741,10 @@ function viewWealth() {
       ${active.some((a) => a.currency !== 'PLN') ? '<div class="foot">Konta w innych walutach nie są wliczane do sum.</div>' : ''}
     </section>
 
+    ${depositReminders()}
+    ${nwChartCard()}
+    <button class="btn primary block" data-action="film" style="margin-bottom:6px">🎬 Film o majątku (30 s)</button>
+
     <div class="sec-head"><h2>Oszczędności i inwestycje</h2><b class="num">${esc(formatMoney(sumPLN(savings, (a) => bal[a.id])))}</b></div>
     ${savingsCards || '<p class="muted small">Dodaj lokatę, IKE, PPK, ETF albo cokolwiek, gdzie odkładasz pieniądze.</p>'}
     <button class="btn block" data-action="add-account" data-group="savings">+ Dodaj oszczędności / inwestycję</button>
@@ -778,6 +791,7 @@ function openAccountSheet(id, group) {
         <p class="small muted">Wartość liczy się sama: złoto wg ceny NBP, srebro wg gold-api.com (przeliczone kursem USD z NBP).</p>
       </div>
       <div class="grid2"><label class="field"><span id="a-open-label">${a ? 'Kwota początkowa' : 'Ile jest tam teraz'}</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
+      ${depositFieldsHtml(a, subtype)}
       <p class="small muted">Kolejne wpłaty i wypłaty dodajesz przyciskami na karcie.</p>`;
   } else if (group === 'property') {
     const loansList = state.data.accounts.filter((x) => x.type === 'loan' && !x.archived);
@@ -819,7 +833,9 @@ function openAccountSheet(id, group) {
     <div class="actions ${a ? 'two' : ''}">${a ? `<button class="btn danger" data-action="del-account" data-id="${esc(a.id)}">Usuń</button>` : ''}<button class="btn primary block" id="a-save">Zapisz</button></div>`);
   const pick = mountImagePicker(a?.image, { preview: () => badgeHtml(badgeFor($('#a-name')?.value || a?.name || '?', accountKindKey({ ...(a || {}), type: group === 'property' ? 'property' : group === 'loan' ? 'loan' : (a?.type || 'checking'), subtype }))) });
   $('#a-name')?.addEventListener('input', () => { if (!pick.get()) $('#img-prev').innerHTML = badgeHtml(badgeFor($('#a-name').value || '?', accountKindKey({ type: group === 'property' ? 'property' : group === 'loan' ? 'loan' : (a?.type || 'checking'), subtype }))); });
+  const dep = mountDepositFields(() => subtype);
   const paintMetal = () => {
+    dep.paint();
     const box = $('#a-metal');
     if (!box) return;
     const metal = !!metalOf({ subtype });
@@ -856,6 +872,9 @@ function openAccountSheet(id, group) {
       item.type = SAVINGS_KINDS[subtype].type;
       item.subtype = subtype;
       item.description = $('#a-desc').value.trim();
+      const d = dep.read();
+      if (d.error) return err(d.error);
+      Object.assign(item, d.data);
       if (metalOf(item)) {
         const g = Number(($('#a-grams').value || '0').replace(/\s/g, '').replace(',', '.'));
         const spread = Number(($('#a-spread').value || '0').replace(',', '.'));
@@ -2425,6 +2444,247 @@ function openBatchSheet(prefill = '') {
   }
 }
 
+// ---------- Lokaty i konta oszczędnościowe ----------
+const isDepositLike = (a) => a && (a.type === 'savings' || a.subtype === 'deposit');
+const pct2 = (x) => String(x).replace('.', ',');
+
+function depositLine(a, bookValue) {
+  if (!a.rate) return '';
+  if (isTermDeposit(a)) {
+    const r = termDeposit({ principal: bookValue, rate: a.rate, months: a.termMonths, startDate: a.startDate, today: todayISO() });
+    return `<div class="dep">
+      <div class="small"><b>${pct2(a.rate)}%</b> w skali roku · lokata ${a.termMonths} mies. · koniec ${esc(formatDatePL(r.end))}${r.ended ? ' · <b class="neg">zakończona</b>' : ` · zostało ${r.daysLeft} dni`}</div>
+      <div class="small muted">Odsetki <span class="num">${esc(formatMoney(r.gross))}</span> − podatek Belki <span class="num">${esc(formatMoney(r.tax))}</span> = <span class="num pos">+${esc(formatMoney(r.net))}</span></div>
+      <div class="dep-pay">Wyciągniesz: <b class="num">${esc(formatMoney(r.payout))}</b></div>
+      <div class="track"><div class="fill" style="width:${r.total ? ((r.passed / r.total) * 100).toFixed(1) : 0}%"></div></div>
+    </div>`;
+  }
+  const promoActive = a.promoRate != null && a.promoMonths && a.startDate && todayISO() < addMonthsDate(a.startDate, a.promoMonths);
+  const e = savingsEstimate({ balance: Math.max(0, bookValue), rate: a.rate, promoRate: a.promoRate, promoLimit: a.promoLimit, promoActive });
+  return `<div class="dep small"><b>${pct2(promoActive ? a.promoRate : a.rate)}%</b> ${promoActive ? `promocja do ${esc(formatDatePL(addMonthsDate(a.startDate, a.promoMonths)))}${a.promoLimit ? ` (do ${esc(formatMoney(a.promoLimit))})` : ''}, potem ${pct2(a.rate)}%` : 'w skali roku'}
+    · zarobisz ok. <b class="num pos">${esc(formatMoney(e.month))}</b>/mies., <span class="num">${esc(formatMoney(e.year))}</span>/rok <span class="muted">(po podatku)</span></div>`;
+}
+
+function depositFieldsHtml(a, subtype) {
+  const kind = a?.depositKind || (subtype === 'deposit' ? 'term' : 'savings');
+  const show = ['deposit'].includes(subtype) || a?.type === 'savings';
+  return `<div id="a-dep" ${show ? '' : 'hidden'}>
+    <div class="field"><span>Oprocentowanie</span><div class="seg" id="a-depkind">
+      <button type="button" data-dk="term" aria-pressed="${kind === 'term'}">Lokata na okres</button>
+      <button type="button" data-dk="savings" aria-pressed="${kind === 'savings'}">Konto oszczędnościowe</button></div></div>
+    <div class="grid2"><label class="field"><span>% w skali roku</span><input id="a-rate2" inputmode="decimal" placeholder="np. 4,5" value="${a?.rate ? esc(pct2(a.rate)) : ''}"></label>
+      <label class="field" id="a-term-wrap"><span>Okres (miesiące)</span><select id="a-term">${[1, 3, 6, 12, 24].map((m) => `<option value="${m}" ${(a?.termMonths || 6) === m ? 'selected' : ''}>${m} mies.</option>`).join('')}</select></label></div>
+    <label class="field"><span id="a-start-label">Data założenia</span><input id="a-start" type="date" value="${esc(a?.startDate || todayISO())}"></label>
+    <details class="more" id="a-promo" ${a?.promoRate != null ? 'open' : ''}><summary>Oprocentowanie promocyjne</summary>
+      <div class="grid3"><label class="field"><span>Promocja %</span><input id="a-prate" inputmode="decimal" value="${a?.promoRate != null ? esc(pct2(a.promoRate)) : ''}"></label>
+        <label class="field"><span>Do kwoty</span><input id="a-plimit" inputmode="decimal" value="${a?.promoLimit ? esc(minorToInput(a.promoLimit)) : ''}"></label>
+        <label class="field"><span>Mies.</span><input id="a-pmonths" type="number" inputmode="numeric" value="${a?.promoMonths || ''}"></label></div>
+    </details>
+    <p class="small muted" id="a-dep-preview"></p>
+  </div>`;
+}
+
+function mountDepositFields(getSubtype) {
+  const box = $('#a-dep');
+  if (!box) return { read: () => ({}), paint: () => {} };
+  let kind = box.querySelector('#a-depkind [aria-pressed="true"]')?.dataset.dk || 'term';
+  const num = (sel) => { const v = $(sel).value.trim().replace(',', '.'); return v ? Number(v) : null; };
+  const preview = () => {
+    const rate = num('#a-rate2');
+    const principal = toMinor($('#a-open').value || '0');
+    if (!rate || !(principal > 0)) { $('#a-dep-preview').textContent = ''; return; }
+    if (kind === 'term') {
+      const r = termDeposit({ principal, rate, months: Number($('#a-term').value), startDate: $('#a-start').value || todayISO(), today: todayISO() });
+      $('#a-dep-preview').innerHTML = `Wyciągniesz <b>${esc(formatMoney(r.payout))}</b> (odsetki ${esc(formatMoney(r.gross))} − podatek ${esc(formatMoney(r.tax))}) · koniec ${esc(formatDatePL(r.end))}`;
+    } else {
+      const e = savingsEstimate({ balance: principal, rate });
+      $('#a-dep-preview').innerHTML = `Ok. <b>${esc(formatMoney(e.month))}</b> miesięcznie po podatku`;
+    }
+  };
+  const paint = () => {
+    const st = getSubtype();
+    box.hidden = !(st === 'deposit');
+    box.querySelectorAll('[data-dk]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.dk === kind)));
+    $('#a-term-wrap').hidden = kind !== 'term';
+    $('#a-promo').hidden = kind === 'term';
+    $('#a-start-label').textContent = kind === 'term' ? 'Data założenia lokaty' : 'Początek promocji (jeśli jest)';
+    preview();
+  };
+  box.querySelector('#a-depkind').onclick = (e) => { const b = e.target.closest('[data-dk]'); if (b) { kind = b.dataset.dk; paint(); } };
+  for (const sel of ['#a-rate2', '#a-term', '#a-start', '#a-open']) $(sel)?.addEventListener('input', preview);
+  paint();
+  return {
+    paint,
+    read() {
+      if (box.hidden) return { ok: true, data: { rate: null, depositKind: null } };
+      const rate = num('#a-rate2');
+      if (rate != null && !(rate >= 0 && rate <= 50)) return { error: 'Oprocentowanie od 0 do 50%.' };
+      if (!rate) return { ok: true, data: { rate: null, depositKind: null } };
+      const data = { rate, depositKind: kind, startDate: $('#a-start').value || todayISO() };
+      if (kind === 'term') Object.assign(data, { termMonths: Number($('#a-term').value), promoRate: null, promoLimit: null, promoMonths: null });
+      else {
+        const pr = num('#a-prate');
+        Object.assign(data, { termMonths: null, promoRate: pr, promoLimit: $('#a-plimit').value.trim() ? toMinor($('#a-plimit').value) : null, promoMonths: num('#a-pmonths') });
+        if (pr != null && !(pr >= 0 && pr <= 50)) return { error: 'Promocja: od 0 do 50%.' };
+      }
+      return { ok: true, data };
+    },
+  };
+}
+
+/** Przypomnienia o lokatach (tylko przypomnienie — nic nie dzieje się automatycznie). */
+function depositReminders() {
+  const txs = liveTx();
+  const bookB = balances(state.data.accounts, txs);
+  let snoozed = {};
+  try { snoozed = JSON.parse(localStorage.getItem('sf-dep-snooze') || '{}'); } catch { /* brak */ }
+  const due = depositsDue(state.data.accounts, bookB, todayISO(), 7, snoozed);
+  return due.map((d) => `<div class="note warn dep-note">🔔 <b>${esc(d.account.name)}</b>: ${d.ended ? 'lokata się skończyła' : `koniec za ${d.daysLeft} ${d.daysLeft === 1 ? 'dzień' : 'dni'} (${esc(formatDatePL(d.end))})`}.
+    Wyciągniesz <b class="num">${esc(formatMoney(d.payout))}</b> (w tym +${esc(formatMoney(d.net))} odsetek po podatku).
+    <div class="actions three-btn">
+      <button class="btn primary" data-action="dep-payout" data-id="${esc(d.account.id)}">Wypłać na konto</button>
+      <button class="btn" data-action="dep-renew" data-id="${esc(d.account.id)}">Odnów</button>
+      <button class="btn" data-action="dep-snooze" data-id="${esc(d.account.id)}">Później</button>
+    </div></div>`).join('');
+}
+
+/** Zapisuje odsetki z zakończonej lokaty jako przychód na lokacie (kategoria „Inne przychody”). */
+async function bookDepositInterest(a) {
+  const bookB = balances(state.data.accounts, liveTx())[a.id];
+  const r = termDeposit({ principal: bookB, rate: a.rate, months: a.termMonths, startDate: a.startDate, today: todayISO() });
+  const now = new Date().toISOString();
+  if (r.net > 0) {
+    await db.put('transactions', { id: db.newId('tx'), createdAt: now, updatedAt: now, type: 'income', amount: r.net, currency: a.currency, date: r.ended ? r.end : todayISO(),
+      categoryId: 'inc-other', accountId: a.id, toAccountId: null, description: `Odsetki: ${a.name}`, tags: ['odsetki'], recurring: false, refund: false });
+  }
+  return r;
+}
+
+async function depositAction(kind, id) {
+  const a = accById()[id];
+  if (!a) return;
+  if (kind === 'snooze') {
+    let s = {};
+    try { s = JSON.parse(localStorage.getItem('sf-dep-snooze') || '{}'); } catch { /* brak */ }
+    s[id] = addDays(todayISO(), 1);
+    try { localStorage.setItem('sf-dep-snooze', JSON.stringify(s)); } catch { /* brak */ }
+    render();
+    toast('Przypomnę jutro');
+    return;
+  }
+  const r = termDeposit({ principal: balances(state.data.accounts, liveTx())[a.id], rate: a.rate, months: a.termMonths, startDate: a.startDate, today: todayISO() });
+  const ok = await confirmSheet(kind === 'renew' ? 'Odnowić lokatę?' : 'Wypłacić lokatę?',
+    kind === 'renew'
+      ? `Odsetki <b>+${esc(formatMoney(r.net))}</b> zostaną dopisane do lokaty, a nowy okres (${a.termMonths} mies., ${pct2(a.rate)}%) zacznie się ${esc(formatDatePL(r.ended ? r.end : todayISO()))}. Oprocentowanie zmienisz później w Edytuj.`
+      : `Odsetki <b>+${esc(formatMoney(r.net))}</b> zostaną zapisane jako przychód, a potem otworzy się przelew całej kwoty <b>${esc(formatMoney(r.payout))}</b> na wybrane konto.`,
+    { confirmLabel: kind === 'renew' ? 'Odnów' : 'Dalej' });
+  if (!ok) return;
+  await bookDepositInterest(a);
+  if (kind === 'renew') {
+    await db.put('accounts', { ...a, startDate: r.ended ? r.end : todayISO() });
+    await reload();
+    toast('Lokata odnowiona');
+  } else {
+    await db.put('accounts', { ...a, depositKind: 'term', rate: a.rate, startDate: a.startDate });
+    await reload();
+    await openMoveSheet(a.id, 'out');
+    $('#mv-amount').value = minorToInput(balances(state.data.accounts, liveTx())[a.id]);
+  }
+}
+
+// ---------- Wykres majątku w czasie ----------
+const PART_COLORS = { current: '#5b8def', savings: 'var(--accent)', property: '#c9a227', debt: 'var(--expense)' };
+const PART_LABELS = { current: 'Konta', savings: 'Oszczędności i inwestycje', property: 'Nieruchomości', debt: 'Długi' };
+
+function nwSeries() {
+  return netWorthHistory({ accounts: state.data.accounts, transactions: liveTx(), prices: state.prices, snapshots: state.snapshots || {}, currentYm: monthKey(todayISO()), today: todayISO() });
+}
+
+function nwChartCard({ lpAttr = '' } = {}) {
+  const all = nwSeries();
+  const range = state.nwRange || '12';
+  const series = range === 'all' ? all : all.slice(-Number(range));
+  const st = historyStats(all);
+  const layers = state.nwLayers;
+  const chip = (id, l) => `<button class="chip" data-action="nw-range" data-r="${id}" aria-pressed="${range === id}">${l}</button>`;
+  const sign = (v) => `${v >= 0 ? '+' : '−'}${formatMoney(Math.abs(v))}`;
+  const labels = series.map((p) => `${monthShortPL(p.ym)}${p.ym.endsWith('-01') || series.length < 13 ? ' ' + p.ym.slice(2, 4) : ''}`);
+  const lines = [{ values: series.map((p) => p.net), color: 'var(--accent)' }];
+  if (layers) for (const k of ['current', 'savings', 'property', 'debt']) if (series.some((p) => p.parts[k])) lines.push({ values: series.map((p) => p.parts[k]), color: PART_COLORS[k], dash: true });
+  return `<section class="card chart" ${lpAttr}><h2>Majątek w czasie <button class="link" data-action="film">🎬 Film</button></h2>
+    ${series.length > 1 ? lineChart(lines, labels, { height: 170, fromZero: false }) : '<p class="small muted">Wykres pojawi się, gdy będzie co najmniej miesiąc danych. Już teraz liczy się historia z Twoich transakcji.</p>'}
+    ${layers ? `<div class="legend"><span><i style="background:var(--accent)"></i>Netto</span>${['current', 'savings', 'property', 'debt'].filter((k) => series.some((p) => p.parts[k])).map((k) => `<span><i style="background:${PART_COLORS[k]}"></i>${PART_LABELS[k]}</span>`).join('')}</div>` : ''}
+    <div class="chips" style="margin-top:8px">${chip('6', '6 mies.')}${chip('12', '12 mies.')}${chip('all', 'Wszystko')}<button class="chip" data-action="nw-layers" aria-pressed="${!!layers}">Warstwy</button></div>
+    ${st ? `<div class="stat-row" style="margin-top:10px">
+      <div class="stat"><small>Za miesiąc</small><b class="${(st.m1 ?? 0) >= 0 ? 'pos' : 'neg'}">${st.m1 != null ? `<span class="num">${esc(sign(st.m1))}</span>` : '—'}</b>${st.m1pct != null ? `<small>${esc(fmtPct(st.m1pct * 100))}</small>` : ''}</div>
+      <div class="stat"><small>Za rok</small><b class="${(st.y1 ?? 0) >= 0 ? 'pos' : 'neg'}">${st.y1 != null ? `<span class="num">${esc(sign(st.y1))}</span>` : '—'}</b>${st.y1pct != null ? `<small>${esc(fmtPct(st.y1pct * 100))}</small>` : ''}</div>
+      <div class="stat"><small>Średnio / mies.</small><b class="num">${st.months > 1 ? esc(sign(st.avg)) : '—'}</b>${st.best && st.months > 1 ? `<small>najlepszy: ${esc(monthShortPL(st.best.ym))}</small>` : ''}</div>
+    </div>` : ''}
+  </section>`;
+}
+
+/** Raz dziennie zapisuje „zdjęcie” majątku za bieżący miesiąc (dokładna historia także dla wycen ręcznych). */
+async function saveSnapshot() {
+  const ym = monthKey(todayISO());
+  const w = valuedNetWorth(state.data.accounts, liveTx(), valOpts());
+  const snaps = { ...(state.snapshots || {}) };
+  snaps[ym] = { net: w.net, assets: w.assets, liabilities: w.liabilities, parts: breakdown(state.data.accounts, w.values), at: todayISO() };
+  state.snapshots = snaps;
+  await db.setSetting('nwSnapshots', snaps);
+}
+
+// ---------- Film o majątku ----------
+function filmData() {
+  const txs = liveTx();
+  const now = monthKey(todayISO());
+  const w = valuedNetWorth(state.data.accounts, txs, valOpts());
+  const parts = breakdown(state.data.accounts, w.values);
+  const hist = nwSeries().slice(-24);
+  const st = historyStats(nwSeries());
+  const avg = averages(txs, now, 3);
+  const cur = monthSummary(txs, now);
+  const cats = catById();
+  const byP = Object.entries(rollupByParent(cur.expenseByCategory, state.data.categories)).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  const prev = monthSummary(txs, addMonths(now, -1));
+  const ch = categoryChanges(cur, prev, state.data.categories).filter((c) => c.diff > 0)[0];
+  const s = simSettings();
+  const sim = runSim(s, simStart());
+  const pay = sim.payoffs.filter((p) => p.month != null).sort((a, b) => a.month - b.month)[0];
+  const y0 = Number(todayISO().slice(0, 4));
+  const fmt = (v) => formatMoney(v).replace(/,\d\d(?=\s*zł)/, '');
+  const fmtSpeak = (v) => `${Math.round(v / 100).toLocaleString('pl-PL')} złotych`;
+  const name = state.profile?.name;
+  return {
+    title: name ? `${name}, Twój majątek` : 'Twój majątek',
+    subtitle: monthNamePL(now),
+    net: w.net,
+    parts: [
+      { label: 'Konta', value: parts.current, color: '#8fb6ff' },
+      { label: 'Oszczędności i inwestycje', value: parts.savings, color: '#7CF0B4' },
+      { label: 'Nieruchomości', value: parts.property, color: '#FFD54A' },
+      { label: 'Długi', value: parts.debt, color: '#FF9C8F' },
+    ],
+    history: hist.map((h) => ({ label: `${monthShortPL(h.ym)} ${h.ym.slice(2, 4)}`, net: h.net })),
+    m1: st?.m1 ?? null,
+    avgGrowth: st && st.months > 1 ? st.avg : null,
+    savingsRate: avg.months && avg.income > 0 ? Math.max(0, avg.net / avg.income) : cur.savingsRate,
+    topCategory: byP[0] ? `${catLabel(byP[0][0], cats)} · ${fmt(byP[0][1])}` : null,
+    rising: ch ? `${catLabel(ch.categoryId, cats)} +${fmt(ch.diff)}` : null,
+    future: sim.series.map((p) => ({ net: p.net })),
+    futureYears: s.years,
+    futureNet: sim.final.net,
+    payoffText: pay ? `${pay.name} spłacony: ${monthNamePL(addMonths(now, pay.month)).toLowerCase()}` : (sim.milestones[0] ? `${fmt(sim.milestones[0].amount)} netto: ${monthNamePL(addMonths(now, sim.milestones[0].month)).toLowerCase()}` : ''),
+    outro: w.net >= 0 ? (st?.m1 > 0 ? 'Idziesz w dobrą stronę! 🚀' : 'Krok po kroku do celu 💪') : 'Każda spłata to krok do przodu 💪',
+    fmt, fmtSpeak,
+  };
+}
+
+function openFilm() {
+  const root = $('#film-root');
+  if (!root) return;
+  playFilm(root, filmData(), { voice: getPref('sf-film-voice', '0') === '1', onClose: () => {} });
+}
+
 // ---------- Ustawienia ----------
 function getPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -2459,6 +2719,7 @@ function viewSettings() {
     </section>
     <section class="card"><h2>Wygląd</h2>
       <div class="row-set" style="border-top:0;padding-top:0"><span>Animacja przy uruchomieniu<span class="sub">2 sekundy, dotknięcie pomija</span></span>${sw('set-splash', getPref('sf-splash', '1') === '1', 'splash-toggle')}</div>
+      <div class="row-set"><span>Lektor w filmie o majątku<span class="sub">Głos syntezatora telefonu (po polsku)</span></span>${sw('set-film-voice', getPref('sf-film-voice', '0') === '1', 'film-voice-toggle')}</div>
       <div class="row-set"><span>Ikony generowane<span class="sub">Kolory banków i firm, inicjały, ikony rodzaju — bez internetu</span></span>${sw('set-genicons', genIconsOn(), 'genicons-toggle')}</div>
       <div class="field" style="margin-top:0"><span>Motyw</span>${seg('theme', 'theme', theme, { system: 'Systemowy', light: 'Jasny', dark: 'Ciemny' })}</div>
       <div class="field"><span>Kolor aplikacji</span><div class="swatches">${Object.entries(ACCENTS).map(([id, a]) =>
@@ -3095,6 +3356,13 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'dep-payout': depositAction('payout', el.dataset.id); break;
+    case 'dep-renew': depositAction('renew', el.dataset.id); break;
+    case 'dep-snooze': depositAction('snooze', el.dataset.id); break;
+    case 'nw-range': state.nwRange = el.dataset.r; render(); break;
+    case 'nw-layers': state.nwLayers = !state.nwLayers; render(); break;
+    case 'film': openFilm(); break;
+    case 'film-voice-toggle': setPref('sf-film-voice', el.checked ? '1' : '0'); break;
     case 'pos-add': openPositionSheet(el.dataset.id); break;
     case 'pos-edit': openPositionSheet(el.dataset.id, el.dataset.pid); break;
     case 'batch': openBatchSheet(); break;
@@ -3350,6 +3618,7 @@ async function init() {
     state.prices = await db.getSetting('metalPrices', null);
     state.simSettings = await db.getSetting('simSettings', null);
     state.profile = await db.getSetting('profile', null);
+    state.snapshots = (await db.getSetting('nwSnapshots', null)) || {};
     if (state.profile?.name) setPref('sf-name', state.profile.name);
     state.prefs.defaultAccount = await db.getSetting('defaultAccount', '') || '';
     await loadData();
@@ -3362,6 +3631,7 @@ async function init() {
   route();
   biometricAvailable().then((v) => { state.bioAvailable = v; if (state.view === 'settings') render(); });
   if (hasMetals() || hasCrypto() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
+  saveSnapshot().catch(() => {});
   await locked;
   if (shortcut === 'expense' || shortcut === 'income') openTxSheet(null, { type: shortcut });
   else if (shortcut === 'voice') openTxSheet(null, { voice: true });
