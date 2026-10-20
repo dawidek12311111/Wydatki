@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; manifest-src 'self'; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0b1412" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="Prywatna aplikacja do budżetu domowego. Dane zostają w Twoim telefonie.">
+  <title>Smart Finance</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1 id="title">Smart Finance</h1>
+    <div id="month-nav" class="month-nav" hidden>
+      <button class="icon-btn" data-action="month-prev" aria-label="Poprzedni miesiąc">‹</button>
+      <button class="month-label" id="month-label" data-action="month-today"></button>
+      <button class="icon-btn" data-action="month-next" aria-label="Następny miesiąc">›</button>
+    </div>
+  </header>
+
+  <main id="view" tabindex="-1">
+    <p class="loading">Ładowanie…</p>
+  </main>
+
+  <button class="fab" data-action="add" aria-label="Dodaj transakcję">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+  </button>
+
+  <nav class="tabbar" aria-label="Główna nawigacja">
+    <a href="#dashboard" data-tab="dashboard"><svg viewBox="0 0 24 24"><path d="M4 13h6V4H4zM14 20h6v-9h-6zM4 20h6v-3H4zM14 4v3h6V4z"/></svg><span>Start</span></a>
+    <a href="#transactions" data-tab="transactions"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10"/></svg><span>Transakcje</span></a>
+    <a href="#budget" data-tab="budget"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M12 4v8l6 4"/></svg><span>Budżet</span></a>
+    <a href="#wealth" data-tab="wealth"><svg viewBox="0 0 24 24"><path d="M3 10l9-6 9 6M5 10v9M19 10v9M9 10v9M15 10v9M3 20h18"/></svg><span>Majątek</span></a>
+    <a href="#analytics" data-tab="analytics"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg><span>Analityka</span></a>
+    <a href="#settings" data-tab="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg><span>Ustawienia</span></a>
+  </nav>
+
+  <dialog id="sheet" class="sheet" aria-labelledby="sheet-title"></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <input type="file" id="file-input" accept="application/json,.json" hidden>
+
+  <noscript>Ta aplikacja wymaga włączonego JavaScriptu.</noscript>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
