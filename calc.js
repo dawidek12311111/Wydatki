@@ -152,6 +152,49 @@ export function budgetStatus(budgets, summary, categories) {
     });
 }
 
+/** Saldo konta z transakcji o dacie wcześniejszej niż isoDate. */
+export function balanceBefore(account, transactions, isoDate) {
+  let sum = account.openingBalance || 0;
+  for (const t of transactions) if (t.date < isoDate) sum += effectOnAccount(t, account.id);
+  return sum;
+}
+
+/**
+ * Ruch na koncie w miesiącu: saldo przed, wpływy, odpływy, saldo po.
+ * Dla kredytu (saldo ujemne): przed = -before, spłacono = inflow, po = -after.
+ */
+export function accountMonth(account, transactions, ym) {
+  const start = `${ym}-01`;
+  const next = `${addMonths(ym, 1)}-01`;
+  const before = balanceBefore(account, transactions, start);
+  let inflow = 0;
+  let outflow = 0;
+  for (const t of transactions) {
+    if (t.date < start || t.date >= next) continue;
+    const e = effectOnAccount(t, account.id);
+    if (e > 0) inflow += e; else outflow -= e;
+  }
+  return { before, inflow, outflow, after: before + inflow - outflow };
+}
+
+/** Podsumowanie listy „Do zapłaty” w miesiącu. */
+export function billsSummary(bills, ym) {
+  const list = bills.filter((b) => b.month === ym);
+  const total = list.reduce((s, b) => s + b.amount, 0);
+  const paid = list.filter((b) => b.paid).reduce((s, b) => s + b.amount, 0);
+  return { count: list.length, paidCount: list.filter((b) => b.paid).length, total, paid, left: total - paid };
+}
+
+/** Pozycje z miesiąca fromYm, których jeszcze nie ma w toYm (porównanie po nazwie). */
+export function billsToCopy(bills, fromYm, toYm) {
+  const key = (b) => b.name.trim().toLowerCase();
+  const existing = new Set(bills.filter((b) => b.month === toYm).map(key));
+  return bills
+    .filter((b) => b.month === fromYm && !existing.has(key(b)))
+    .sort((a, b) => (a.order || 0) - (b.order || 0))
+    .map((b) => ({ name: b.name, amount: b.amount, icon: b.icon, note: b.note || '', month: toYm, paid: false }));
+}
+
 /** Porównanie kategorii między dwoma miesiącami — posortowane od największego wzrostu. */
 export function categoryChanges(current, previous, categories) {
   const a = rollupByParent(current.expenseByCategory, categories);

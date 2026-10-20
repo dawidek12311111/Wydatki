@@ -1,24 +1,24 @@
 // Smart Finance — interfejs aplikacji (ekrany, formularze, nawigacja).
 import * as db from './db.js';
 import {
-  balances, netWorth, monthSummary, rollupByParent, budgetStatus, averages,
-  monthlySeries, categoryChanges, isLive,
+  balances, netWorth, monthSummary, rollupByParent, averages, effectOnAccount,
+  monthlySeries, categoryChanges, isLive, accountMonth, billsSummary, billsToCopy,
 } from './calc.js';
 import { toMinor, formatMoney, minorToInput } from './money.js';
 import { todayISO, monthKey, addMonths, monthNamePL, monthShortPL, dayLabelPL, formatDatePL } from './dates.js';
 import { parseQuick, guessCategory } from './parse.js';
-import { validateTransaction, validateBackup } from './validate.js';
+import { validateTransaction, validateBackup, validateBill } from './validate.js';
 import { transactionsToCSV } from './csv.js';
-import { ACCOUNT_TYPES, CURRENCIES } from './defaults.js';
+import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
 
-export const APP_VERSION = '0.2.1 (MVP)';
+export const APP_VERSION = '0.3.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = (m, cur = 'PLN', o) => `<span class="num">${esc(formatMoney(m, cur, o))}</span>`;
 
 const state = {
-  data: { accounts: [], categories: [], transactions: [], budgets: [] },
+  data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [] },
   view: 'dashboard',
   month: monthKey(todayISO()),
   txFilter: 'all',
@@ -30,8 +30,8 @@ const state = {
 const VIEWS = {
   dashboard: { title: 'Start', month: true },
   transactions: { title: 'Transakcje', month: true },
-  budget: { title: 'Budżet', month: true },
-  wealth: { title: 'Majątek', month: false },
+  budget: { title: 'Do zapłaty', month: true },
+  wealth: { title: 'Majątek', month: true },
   analytics: { title: 'Analityka', month: true },
   settings: { title: 'Ustawienia', month: false },
 };
@@ -68,7 +68,7 @@ const pct = (x) => (x == null ? '—' : `${Math.round(x * 100)}%`);
 function txRow(t, cats = catById(), accs = accById()) {
   const title = t.description || (t.type === 'transfer' ? 'Transfer' : catLabel(t.categoryId, cats));
   const sub = t.type === 'transfer'
-    ? `${accs[t.accountId]?.name || '?'} → ${accs[t.toAccountId]?.name || '?'}`
+    ? `${accs[t.accountId]?.name || 'tylko zapis'} → ${accs[t.toAccountId]?.name || 'tylko zapis'}`
     : `${catLabel(t.categoryId, cats)} · ${accs[t.accountId]?.name || '?'}`;
   const amt = t.type === 'transfer' ? formatMoney(t.amount, t.currency) : formatMoney(signedAmount(t), t.currency, { sign: true });
   const badges = `${t.refund ? '<span class="badge">zwrot</span>' : ''}${t.recurring ? '<span class="badge">cykl.</span>' : ''}`;
@@ -163,9 +163,17 @@ function viewDashboard() {
     </div>
   </section>`);
 
-  const status = budgetStatus(state.data.budgets, s, state.data.categories).filter((b) => b.ratio >= 0.8).sort((a, b) => b.ratio - a.ratio);
-  if (status.length) {
-    parts.push(`<section class="card"><h2>Uwaga na budżet <a href="#budget">Budżet ›</a></h2><ul class="bars">${status.map((b) => budgetBar(b, cats)).join('')}</ul></section>`);
+  const bs = billsSummary(state.data.bills, state.month);
+  if (bs.count) {
+    const unpaid = billsOfMonth().filter((b) => !b.paid);
+    parts.push(`<section class="card"><h2>Do zapłaty <a href="#budget">Lista ›</a></h2>
+      <div class="stat-row">
+        <div class="stat"><small>Zostało</small><b class="${bs.left > 0 ? 'neg' : 'pos'}">${money(bs.left)}</b></div>
+        <div class="stat"><small>Zapłacone</small><b>${money(bs.paid)}</b></div>
+        <div class="stat"><small>Opłacone</small><b>${bs.paidCount} / ${bs.count}</b></div>
+      </div>
+      ${unpaid.length ? `<p class="small muted" style="margin:10px 0 0">Niezapłacone: ${unpaid.slice(0, 4).map((b) => esc(b.icon || '') + ' ' + esc(b.name)).join(', ')}${unpaid.length > 4 ? '…' : ''}</p>` : ''}
+    </section>`);
   }
 
   const byParent = Object.entries(rollupByParent(s.expenseByCategory, state.data.categories))
@@ -232,149 +240,370 @@ function renderTxList() {
   if (el) el.innerHTML = txListHtml();
 }
 
-// ---------- Budżet ----------
-function budgetBar(b, cats) {
-  const cls = b.ratio > 1 ? 'over' : b.ratio >= 0.8 ? 'near' : '';
-  return `<li><button class="rowbtn" data-action="edit-budget" data-id="${esc(b.categoryId)}">
-    <div class="row"><span>${esc(catIcon(b.categoryId, cats))} ${esc(catLabel(b.categoryId, cats))}</span>
-    <span class="num ${b.ratio > 1 ? 'neg' : ''}">${esc(formatMoney(b.spent))} / ${esc(formatMoney(b.limit))}</span></div>
-    <div class="track"><div class="fill ${cls}" style="width:${Math.min(100, b.ratio * 100).toFixed(1)}%"></div></div>
-    <div class="small muted">${b.left >= 0 ? `Zostało ${esc(formatMoney(b.left))}` : `Przekroczono o ${esc(formatMoney(-b.left))}`}</div>
-  </button></li>`;
+// ---------- Budżet: lista „Do zapłaty” ----------
+function billsOfMonth(ym = state.month) {
+  return state.data.bills.filter((b) => b.month === ym)
+    .sort((a, b) => (a.order || 0) - (b.order || 0) || (a.createdAt || '').localeCompare(b.createdAt || ''));
+}
+
+function billRow(b) {
+  return `<div class="item bill ${b.paid ? 'is-paid' : ''}">
+    <button class="bill-main" data-action="edit-bill" data-id="${esc(b.id)}">
+      <span class="ico" aria-hidden="true">${esc(b.icon || '📄')}</span>
+      <span class="mid"><span class="t1">${esc(b.name)}</span><span class="t2 num">${esc(formatMoney(b.amount))}${b.note ? ' · ' + esc(b.note) : ''}</span></span>
+    </button>
+    <button class="paybtn ${b.paid ? 'paid' : 'unpaid'}" data-action="toggle-bill" data-id="${esc(b.id)}"
+      aria-label="${b.paid ? 'Zapłacone — dotknij, aby oznaczyć jako niezapłacone' : 'Niezapłacone — dotknij, aby oznaczyć jako zapłacone'}">${b.paid ? '✓' : '✕'}</button>
+  </div>`;
 }
 
 function viewBudget() {
-  const cats = catById();
-  const s = monthSummary(liveTx(), state.month);
-  const status = budgetStatus(state.data.budgets, s, state.data.categories);
-  const withLimit = new Set(status.map((b) => b.categoryId));
-  const byParent = rollupByParent(s.expenseByCategory, state.data.categories);
-  const totalLimit = status.reduce((a, b) => a + b.limit, 0);
-  const spentInBudgets = status.reduce((a, b) => a + b.spent, 0);
-  const noLimit = state.data.categories
-    .filter((c) => c.kind === 'expense' && !c.parentId && !c.archived && !withLimit.has(c.id))
-    .sort((a, b) => (byParent[b.id] || 0) - (byParent[a.id] || 0));
-
-  return `<section class="card">
-      <h2>Podsumowanie miesiąca</h2>
-      <div class="stat-row">
-        <div class="stat"><small>Wydatki</small><b>${money(s.expense)}</b></div>
-        <div class="stat"><small>Suma limitów</small><b>${money(totalLimit)}</b></div>
-        <div class="stat"><small>Zostało</small><b class="${totalLimit - spentInBudgets < 0 ? 'neg' : ''}">${money(totalLimit - spentInBudgets)}</b></div>
+  const ym = state.month;
+  const list = billsOfMonth(ym);
+  const s = billsSummary(state.data.bills, ym);
+  const prevYm = addMonths(ym, -1);
+  const toCopy = billsToCopy(state.data.bills, prevYm, ym);
+  const progress = s.total ? (s.paid / s.total) * 100 : 0;
+  return `<section class="card hero">
+      <h2>Do zapłaty: ${esc(monthNamePL(ym).toLowerCase())}</h2>
+      <div class="big num">${esc(formatMoney(s.left))}</div>
+      <div class="split">
+        <div><small>Razem</small><b class="num">${esc(formatMoney(s.total))}</b></div>
+        <div><small>Zapłacone</small><b class="num">${esc(formatMoney(s.paid))}</b></div>
       </div>
+      <div class="track light"><div class="fill" style="width:${progress.toFixed(1)}%"></div></div>
+      <div class="foot">${s.count ? `Opłacone ${s.paidCount} z ${s.count}${s.left === 0 ? ' — wszystko zapłacone 🎉' : ''}` : 'Lista jest pusta'}</div>
     </section>
-    ${status.length ? `<section class="card"><h2>Limity kategorii</h2><ul class="bars">${status.sort((a, b) => b.ratio - a.ratio).map((b) => budgetBar(b, cats)).join('')}</ul></section>` : ''}
-    <section class="card"><h2>Bez limitu</h2>
-      <ul class="menu">${noLimit.map((c) => `<li><button data-action="edit-budget" data-id="${esc(c.id)}">
-        <span>${esc(c.icon || '')} ${esc(c.name)}<span class="sub">wydano ${esc(formatMoney(byParent[c.id] || 0))}</span></span>
-        <span class="link">Ustaw limit</span></button></li>`).join('')}</ul>
-    </section>
-    <p class="note">Limit „co miesiąc” obowiązuje w każdym miesiącu; limit „tylko ten miesiąc” go nadpisuje. Podkategorie (np. Paliwo) liczą się do kategorii nadrzędnej (Transport).</p>`;
+    ${list.length ? `<div class="list">${list.map(billRow).join('')}</div>` : `<div class="empty"><span class="em">🧾</span>Dodaj rachunki i opłaty na ${esc(monthNamePL(ym).toLowerCase())}.</div>`}
+    <div class="actions">
+      <button class="btn primary block" data-action="add-bill">+ Dodaj do zapłaty</button>
+      ${toCopy.length ? `<button class="btn block" data-action="copy-bills">Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
+    </div>
+    <p class="note">Dotknij ✕ / ✓, żeby zmienić status. Dotknij nazwy, żeby edytować. Strzałkami u góry przejdziesz na kolejny miesiąc i zaplanujesz opłaty z wyprzedzeniem.</p>`;
 }
 
-function openBudgetSheet(categoryId) {
-  const cat = catById()[categoryId];
-  const monthB = state.data.budgets.find((b) => b.id === `${state.month}:${categoryId}`);
-  const defB = state.data.budgets.find((b) => b.id === `default:${categoryId}`);
-  const current = monthB || defB;
-  openSheet(`Limit: ${cat?.name || ''}`, `
-    <label class="field"><span>Kwota limitu (zł)</span>
-      <input id="b-amount" class="amount-input" inputmode="decimal" placeholder="0" value="${current ? esc(minorToInput(current.limit)) : ''}"></label>
-    <div class="field"><span>Obowiązuje</span>
-      <div class="seg" id="b-scope">
-        <button type="button" data-scope="default" aria-pressed="${!monthB}">Co miesiąc</button>
-        <button type="button" data-scope="month" aria-pressed="${!!monthB}">Tylko ${esc(monthNamePL(state.month).toLowerCase())}</button>
-      </div></div>
-    <div class="err" id="b-err"></div>
-    <div class="actions two">
-      <button class="btn danger" id="b-del" ${current ? '' : 'disabled'}>Usuń limit</button>
-      <button class="btn primary" id="b-save">Zapisz</button>
+function openBillSheet(id) {
+  const b = id ? state.data.bills.find((x) => x.id === id) : null;
+  let icon = b?.icon || BILL_ICONS[0];
+  openSheet(b ? 'Edytuj pozycję' : `Do zapłaty: ${monthNamePL(state.month).toLowerCase()}`, `
+    <label class="field"><span>Co trzeba zapłacić</span><input id="bl-name" maxlength="80" value="${esc(b?.name || '')}" placeholder="np. Czynsz, Prąd, Przedszkole" autocomplete="off"></label>
+    <label class="field"><span>Kwota</span><input id="bl-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${b ? esc(minorToInput(b.amount)) : ''}" autocomplete="off"></label>
+    <div class="field"><span>Ikona</span><div class="icongrid" id="bl-icons">${BILL_ICONS.map((i) => `<button type="button" data-icon="${i}" aria-pressed="${i === icon}">${i}</button>`).join('')}</div>
+      <input id="bl-icon-custom" maxlength="4" placeholder="lub wpisz własne emoji" value="${BILL_ICONS.includes(icon) ? '' : esc(icon)}"></div>
+    <label class="field"><span>Notatka (opcjonalnie)</span><input id="bl-note" maxlength="80" value="${esc(b?.note || '')}" placeholder="np. termin 10-go, nr konta w mailu"></label>
+    <label class="check"><input type="checkbox" id="bl-paid" ${b?.paid ? 'checked' : ''}> Zapłacone</label>
+    <div class="err" id="bl-err" role="alert"></div>
+    <div class="actions ${b ? 'two' : ''}">
+      ${b ? '<button class="btn danger" id="bl-del">Usuń</button>' : ''}
+      <button class="btn primary block" id="bl-save">${b ? 'Zapisz' : 'Dodaj'}</button>
     </div>`);
-  const sheet = $('#sheet');
-  sheet.querySelectorAll('#b-scope button').forEach((b) => {
-    b.onclick = () => sheet.querySelectorAll('#b-scope button').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
-  });
-  const scopeId = () => (sheet.querySelector('#b-scope [aria-pressed="true"]').dataset.scope === 'month' ? `${state.month}:${categoryId}` : `default:${categoryId}`);
-  $('#b-save').onclick = async () => {
-    const limit = toMinor($('#b-amount').value);
-    if (!Number.isInteger(limit) || limit <= 0) { $('#b-err').textContent = 'Podaj kwotę większą od zera.'; return; }
-    await db.put('budgets', { id: scopeId(), limit });
+  const grid = $('#bl-icons');
+  grid.onclick = (e) => {
+    const btn = e.target.closest('[data-icon]');
+    if (!btn) return;
+    icon = btn.dataset.icon;
+    $('#bl-icon-custom').value = '';
+    grid.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+  };
+  $('#bl-icon-custom').oninput = (e) => {
+    if (e.target.value.trim()) grid.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', 'false'));
+  };
+  if (!b) setTimeout(() => $('#bl-name').focus(), 50);
+  $('#bl-save').onclick = async () => {
+    const paid = $('#bl-paid').checked;
+    const item = {
+      ...(b || { id: db.newId('bill'), month: state.month, createdAt: new Date().toISOString(), order: Date.now() }),
+      name: $('#bl-name').value.trim(),
+      amount: toMinor($('#bl-amount').value),
+      icon: $('#bl-icon-custom').value.trim() || icon,
+      note: $('#bl-note').value.trim(),
+      paid,
+      paidAt: paid ? (b?.paidAt || new Date().toISOString()) : null,
+    };
+    const errors = validateBill(item);
+    if (errors.length) { $('#bl-err').textContent = errors.join(' · '); return; }
+    await db.put('bills', item);
     closeSheet();
     await reload();
-    toast('Zapisano limit');
+    toast(b ? 'Zapisano' : 'Dodano do listy');
   };
-  $('#b-del').onclick = async () => {
-    await db.remove('budgets', scopeId());
-    closeSheet();
-    await reload();
-    toast('Usunięto limit');
-  };
+  if (b) {
+    $('#bl-del').onclick = async () => {
+      await db.remove('bills', b.id);
+      closeSheet();
+      await reload();
+      toast('Usunięto z listy', { label: 'Cofnij', run: async () => { await db.put('bills', b); await reload(); } });
+    };
+  }
+}
+
+async function toggleBill(id) {
+  const b = state.data.bills.find((x) => x.id === id);
+  if (!b) return;
+  const paid = !b.paid;
+  await db.put('bills', { ...b, paid, paidAt: paid ? new Date().toISOString() : null });
+  await reload();
+}
+
+async function copyBills() {
+  const items = billsToCopy(state.data.bills, addMonths(state.month, -1), state.month);
+  const now = Date.now();
+  await db.put('bills', ...items.map((b, i) => ({ ...b, id: db.newId('bill'), createdAt: new Date().toISOString(), order: now + i, paidAt: null })));
+  await reload();
+  toast(`Skopiowano ${items.length} pozycji`);
 }
 
 // ---------- Majątek ----------
+const monthEnd = (ym) => `${addMonths(ym, 1)}-01`;
+const isCurrentMonth = () => state.month === monthKey(todayISO());
+
+function accountIcon(a) {
+  if (a.type === 'loan') return '📉';
+  if (a.subtype && SAVINGS_KINDS[a.subtype]) return SAVINGS_KINDS[a.subtype].icon;
+  return { checking: '🏦', savings: '🐷', cash: '💵', card: '💳', investment: '📈', other: '📁' }[a.type] || '📁';
+}
+function accountKindLabel(a) {
+  if (a.type === 'loan') return 'Kredyt';
+  if (a.subtype && SAVINGS_KINDS[a.subtype]) return SAVINGS_KINDS[a.subtype].label;
+  return ACCOUNT_TYPES[a.type] || '';
+}
+
 function viewWealth() {
+  const ym = state.month;
   const txs = liveTx();
-  const bal = balances(state.data.accounts, txs);
-  const w = netWorth(state.data.accounts, txs);
-  const groups = {};
-  for (const a of state.data.accounts) {
-    if (a.archived) continue;
-    (groups[a.type] ||= []).push(a);
-  }
-  const otherCur = state.data.accounts.filter((a) => !a.archived && a.currency !== 'PLN');
+  const txsUntil = txs.filter((t) => t.date < monthEnd(ym));
+  const bal = balances(state.data.accounts, txsUntil);
+  const w = netWorth(state.data.accounts, txsUntil);
+  const active = state.data.accounts.filter((a) => !a.archived);
+  const current = active.filter((a) => accountGroup(a) === 'current');
+  const savings = active.filter((a) => accountGroup(a) === 'savings');
+  const loans = active.filter((a) => accountGroup(a) === 'loan');
   const archived = state.data.accounts.filter((a) => a.archived);
+  const sumPLN = (list, fn) => list.filter((a) => a.currency === 'PLN').reduce((s, a) => s + fn(a), 0);
+  const monthWord = esc(monthNamePL(ym).toLowerCase());
+
+  const savingsCards = savings.map((a) => {
+    const m = accountMonth(a, txs, ym);
+    return `<section class="acard">
+      <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
+        <span class="ico">${esc(accountIcon(a))}</span>
+        <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
+        <span class="amt num">${esc(formatMoney(m.after, a.currency))}</span>
+      </button>
+      <div class="acard-month small">${m.inflow || m.outflow ? `W tym miesiącu:${m.inflow ? ` <span class="pos num">wpłaty +${esc(formatMoney(m.inflow, a.currency))}</span>` : ''}${m.inflow && m.outflow ? ' ·' : ''}${m.outflow ? ` <span class="neg num">wypłaty −${esc(formatMoney(m.outflow, a.currency))}</span>` : ''}` : 'Brak wpłat i wypłat w tym miesiącu'}</div>
+      <div class="acard-actions">
+        <button class="btn" data-action="move" data-mode="in" data-id="${esc(a.id)}">+ Wpłata</button>
+        <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">− Wypłata</button>
+      </div>
+    </section>`;
+  }).join('');
+
+  const loanCards = loans.map((a) => {
+    const m = accountMonth(a, txs, ym);
+    const orig = a.loanOriginal || 0;
+    const repaidPct = orig > 0 ? Math.min(100, Math.max(0, ((orig + m.after) / orig) * 100)) : null;
+    return `<section class="acard">
+      <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
+        <span class="ico">📉</span>
+        <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${a.description ? esc(a.description) : 'Kredyt'}${a.installment ? ' · rata ' + esc(formatMoney(a.installment, a.currency)) : ''}</span></span>
+      </button>
+      <div class="acard-grid">
+        <div><small>Przed</small><b class="num">${esc(formatMoney(-m.before, a.currency))}</b></div>
+        <div><small>Spłacono</small><b class="num pos">${esc(formatMoney(m.inflow - m.outflow, a.currency))}</b></div>
+        <div><small>Po</small><b class="num">${esc(formatMoney(-m.after, a.currency))}</b></div>
+      </div>
+      ${repaidPct != null ? `<div class="track"><div class="fill" style="width:${repaidPct.toFixed(1)}%"></div></div>
+        <div class="small muted" style="margin-top:4px">Spłacono ${Math.round(repaidPct)}% z ${esc(formatMoney(orig, a.currency))}</div>` : ''}
+      <div class="acard-actions one"><button class="btn primary" data-action="move" data-mode="pay" data-id="${esc(a.id)}">Dodaj spłatę</button></div>
+    </section>`;
+  }).join('');
+
   return `<section class="card hero">
-      <h2>Majątek netto (PLN)</h2>
+      <h2>Majątek netto — ${isCurrentMonth() ? 'dziś' : 'koniec: ' + monthWord}</h2>
       <div class="big num">${esc(formatMoney(w.net))}</div>
       <div class="split">
         <div><small>Aktywa</small><b class="num">${esc(formatMoney(w.assets))}</b></div>
         <div><small>Zobowiązania</small><b class="num">${esc(formatMoney(w.liabilities))}</b></div>
       </div>
-      ${otherCur.length ? '<div class="foot">Konta w innych walutach nie są wliczane do sumy (przeliczanie kursów — później).</div>' : ''}
+      ${active.some((a) => a.currency !== 'PLN') ? '<div class="foot">Konta w innych walutach nie są wliczane do sum.</div>' : ''}
     </section>
-    ${Object.keys(ACCOUNT_TYPES).filter((t) => groups[t]).map((type) => `
-      <div class="day"><span>${esc(ACCOUNT_TYPES[type])}</span></div>
-      <div class="list">${groups[type].map((a) => `<button class="item" data-action="edit-account" data-id="${esc(a.id)}">
-        <span class="ico">${accountIcon(a.type)}</span>
-        <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(a.currency)}</span></span>
-        <span class="amt num ${bal[a.id] < 0 ? 'neg' : ''}">${esc(formatMoney(bal[a.id], a.currency))}</span></button>`).join('')}</div>`).join('')}
-    <div class="actions"><button class="btn block" data-action="add-account">+ Dodaj konto</button></div>
+
+    <div class="sec-head"><h2>Oszczędności i inwestycje</h2><b class="num">${esc(formatMoney(sumPLN(savings, (a) => bal[a.id])))}</b></div>
+    ${savingsCards || '<p class="muted small">Dodaj lokatę, IKE, PPK, ETF albo cokolwiek, gdzie odkładasz pieniądze.</p>'}
+    <button class="btn block" data-action="add-account" data-group="savings">+ Dodaj oszczędności / inwestycję</button>
+
+    <div class="sec-head"><h2>Kredyty</h2><b class="num">${loans.length ? esc(formatMoney(sumPLN(loans, (a) => -bal[a.id]))) : ''}</b></div>
+    ${loanCards ? `<p class="small muted" style="margin:0 4px 8px">Stan w miesiącu: ${monthWord}</p>${loanCards}` : '<p class="muted small">Brak kredytów.</p>'}
+    <button class="btn block" data-action="add-account" data-group="loan">+ Dodaj kredyt</button>
+
+    <div class="sec-head"><h2>Konta bieżące</h2><b class="num">${esc(formatMoney(sumPLN(current, (a) => bal[a.id])))}</b></div>
+    <div class="list">${current.map((a) => `<button class="item" data-action="account-detail" data-id="${esc(a.id)}">
+      <span class="ico">${esc(accountIcon(a))}</span>
+      <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}</span></span>
+      <span class="amt num ${bal[a.id] < 0 ? 'neg' : ''}">${esc(formatMoney(bal[a.id], a.currency))}</span></button>`).join('')}</div>
+    <div class="actions"><button class="btn block" data-action="add-account" data-group="current">+ Dodaj konto</button></div>
+
     ${archived.length ? `<p class="small muted" style="margin-top:16px">Zarchiwizowane: ${archived.map((a) => `<button class="link" data-action="edit-account" data-id="${esc(a.id)}">${esc(a.name)}</button>`).join(', ')}</p>` : ''}
-    <p class="note">Salda liczone są z salda początkowego i transakcji. Wpłata na oszczędności czy IKE to <b>transfer</b> — nie zmienia majątku i nie jest wydatkiem. Szczegółowe inwestycje (jednostki, wyceny, wynik) dojdą w Etapie 3.</p>`;
+    <p class="note">Wpłaty na oszczędności i spłaty kredytów to przeniesienia pieniędzy — nie są liczone jako wydatki i nie zmieniają majątku netto (chyba że wybierzesz „tylko zapis”).</p>`;
 }
 
-function accountIcon(type) {
-  return { checking: '🏦', savings: '🐷', cash: '💵', card: '💳', investment: '📈', loan: '📉', other: '📁' }[type] || '📁';
-}
-
-function openAccountSheet(id) {
+function openAccountSheet(id, group) {
   const a = id ? accById()[id] : null;
+  group = a ? accountGroup(a) : (group || 'current');
   const used = id && state.data.transactions.some((t) => t.accountId === id || t.toAccountId === id);
-  openSheet(a ? 'Edytuj konto' : 'Nowe konto', `
-    <label class="field"><span>Nazwa</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. mBank, IKE, Kredyt"></label>
-    <label class="field"><span>Rodzaj</span><select id="a-type">${Object.entries(ACCOUNT_TYPES).map(([k, v]) => `<option value="${k}" ${a?.type === k ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select></label>
-    <div class="grid2">
-      <label class="field"><span>Saldo początkowe</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>
-      <label class="field"><span>Waluta</span><select id="a-cur" ${used ? 'disabled' : ''}>${CURRENCIES.map((c) => `<option ${(a?.currency || 'PLN') === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label>
-    </div>
-    <p class="small muted">Saldo początkowe = ile było na koncie, zanim zacząłeś zapisywać transakcje. Dla kredytu wpisz kwotę ze znakiem minus, np. -150000.</p>
-    ${a ? `<label class="check"><input type="checkbox" id="a-arch" ${a.archived ? 'checked' : ''}> Zarchiwizuj (ukryj konto, historia zostaje)</label>` : ''}
-    <div class="err" id="a-err"></div>
+  let subtype = a?.subtype || (a?.type === 'savings' ? 'deposit' : a ? 'other' : 'deposit');
+  const title = a ? 'Edytuj' : { savings: 'Nowe oszczędności / inwestycja', loan: 'Nowy kredyt', current: 'Nowe konto' }[group];
+  const curSelect = `<label class="field"><span>Waluta</span><select id="a-cur" ${used ? 'disabled' : ''}>${CURRENCIES.map((c) => `<option ${(a?.currency || 'PLN') === c ? 'selected' : ''}>${c}</option>`).join('')}</select></label>`;
+  let body = '';
+  if (group === 'savings') {
+    body = `<div class="field"><span>Rodzaj</span><div class="chips wrap" id="a-kind">${Object.entries(SAVINGS_KINDS).map(([k, v]) =>
+      `<button type="button" class="chip" data-kind="${k}" aria-pressed="${k === subtype}">${v.icon} ${esc(v.label)}</button>`).join('')}</div></div>
+      <label class="field"><span>Nazwa</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. IKE w XTB, Lokata mBank"></label>
+      <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. na emeryturę, ETF na MSCI World"></label>
+      <div class="grid2"><label class="field"><span>${a ? 'Kwota początkowa' : 'Ile jest tam teraz'}</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
+      <p class="small muted">Kolejne wpłaty i wypłaty dodajesz przyciskami na karcie.</p>`;
+  } else if (group === 'loan') {
+    body = `<label class="field"><span>Nazwa kredytu</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. Hipoteka PKO, Kredyt na auto"></label>
+      <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. do 2045, oprocentowanie zmienne"></label>
+      <label class="field"><span>${a ? 'Do spłaty na start (zanim zacząłeś zapisywać spłaty)' : 'Ile zostało do spłaty teraz'}</span><input id="a-open" class="amount-input" inputmode="decimal" value="${a ? esc(minorToInput(-a.openingBalance)) : ''}" placeholder="0,00"></label>
+      <div class="grid2">
+        <label class="field"><span>Rata miesięczna (opcj.)</span><input id="a-inst" inputmode="decimal" value="${a?.installment ? esc(minorToInput(a.installment)) : ''}" placeholder="0,00"></label>
+        <label class="field"><span>Kwota kredytu (opcj.)</span><input id="a-orig" inputmode="decimal" value="${a?.loanOriginal ? esc(minorToInput(a.loanOriginal)) : ''}" placeholder="do paska postępu"></label>
+      </div>
+      ${curSelect}`;
+  } else {
+    body = `<label class="field"><span>Nazwa</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. mBank, Portfel"></label>
+      <label class="field"><span>Rodzaj</span><select id="a-type">${['checking', 'cash', 'card', 'other'].map((k) => `<option value="${k}" ${a?.type === k ? 'selected' : ''}>${esc(ACCOUNT_TYPES[k])}</option>`).join('')}</select></label>
+      <div class="grid2"><label class="field"><span>Saldo początkowe</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
+      <p class="small muted">Saldo początkowe = ile było na koncie, zanim zacząłeś zapisywać transakcje.</p>`;
+  }
+  openSheet(title, `${body}
+    ${a ? `<label class="check"><input type="checkbox" id="a-arch" ${a.archived ? 'checked' : ''}> Zarchiwizuj (ukryj, historia zostaje)</label>` : ''}
+    <div class="err" id="a-err" role="alert"></div>
     <div class="actions"><button class="btn primary block" id="a-save">Zapisz</button></div>`);
+  const kinds = $('#a-kind');
+  if (kinds) {
+    kinds.onclick = (e) => {
+      const b = e.target.closest('[data-kind]');
+      if (!b) return;
+      subtype = b.dataset.kind;
+      kinds.querySelectorAll('[data-kind]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    };
+  }
   $('#a-save').onclick = async () => {
+    const err = (m) => { $('#a-err').textContent = m; };
     const name = $('#a-name').value.trim();
-    const opening = $('#a-open').value.trim() ? toMinor($('#a-open').value) : 0;
-    if (!name) { $('#a-err').textContent = 'Podaj nazwę konta.'; return; }
-    if (!Number.isInteger(opening)) { $('#a-err').textContent = 'Nieprawidłowe saldo początkowe.'; return; }
+    if (!name) return err('Podaj nazwę.');
+    const opt = (sel) => ($(sel)?.value.trim() ? toMinor($(sel).value) : 0);
+    let opening = opt('#a-open');
+    if (!Number.isInteger(opening)) return err('Nieprawidłowa kwota.');
     const item = {
       ...(a || { id: db.newId('acc'), createdAt: new Date().toISOString() }),
-      name, type: $('#a-type').value, currency: $('#a-cur').value, openingBalance: opening,
+      name,
+      currency: $('#a-cur').value,
       archived: a ? $('#a-arch').checked : false,
     };
+    if (group === 'savings') {
+      item.type = SAVINGS_KINDS[subtype].type;
+      item.subtype = subtype;
+      item.description = $('#a-desc').value.trim();
+    } else if (group === 'loan') {
+      const inst = opt('#a-inst');
+      const orig = opt('#a-orig');
+      if (opening < 0 || !Number.isInteger(inst) || !Number.isInteger(orig) || inst < 0 || orig < 0) return err('Wpisz kwoty bez minusa.');
+      opening = -opening; // dług zapisujemy jako saldo ujemne
+      item.type = 'loan';
+      item.description = $('#a-desc').value.trim();
+      item.installment = inst || null;
+      item.loanOriginal = orig || null;
+    } else {
+      item.type = $('#a-type').value;
+    }
+    item.openingBalance = opening;
     await db.put('accounts', item);
     closeSheet();
     await reload();
-    toast('Zapisano konto');
+    toast('Zapisano');
+  };
+}
+
+/** Szczegóły konta: historia operacji. */
+function openAccountDetail(id) {
+  const a = accById()[id];
+  if (!a) return;
+  const cats = catById();
+  const accs = accById();
+  const txs = liveTx().filter((t) => t.accountId === id || t.toAccountId === id).sort(byDateDesc);
+  const bal = balances([a], liveTx())[id];
+  const isLoan = a.type === 'loan';
+  openSheet(a.name, `
+    <p class="muted small" style="margin-top:0">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</p>
+    <div class="stat-row" style="grid-template-columns:1fr 1fr">
+      <div class="stat"><small>${isLoan ? 'Do spłaty' : 'Saldo'}</small><b class="num">${esc(formatMoney(isLoan ? -bal : bal, a.currency))}</b></div>
+      <div class="stat"><small>${isLoan ? 'Na start' : 'Saldo początkowe'}</small><b class="num">${esc(formatMoney(isLoan ? -a.openingBalance : a.openingBalance, a.currency))}</b></div>
+    </div>
+    <h3 class="small muted" style="margin:16px 4px 6px">Historia</h3>
+    ${txs.length ? `<div class="list">${txs.map((t) => {
+      const e = effectOnAccount(t, id);
+      const other = t.type === 'transfer' ? (t.accountId === id ? accs[t.toAccountId]?.name : accs[t.accountId]?.name) || 'tylko zapis' : catLabel(t.categoryId, cats);
+      return `<button class="item" data-action="edit-tx" data-id="${esc(t.id)}">
+        <span class="mid"><span class="t1">${esc(t.description || (e >= 0 ? (isLoan ? 'Spłata' : 'Wpłata') : 'Wypłata'))}</span><span class="t2">${esc(formatDatePL(t.date))} · ${esc(other)}</span></span>
+        <span class="amt num ${e >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(e, a.currency, { sign: true }))}</span></button>`;
+    }).join('')}</div>` : '<p class="muted small">Brak operacji.</p>'}
+    <div class="actions"><button class="btn block" data-action="edit-account" data-id="${esc(id)}">Edytuj ${isLoan ? 'kredyt' : 'konto'}</button></div>`);
+}
+
+/** Wpłata / wypłata na oszczędności albo spłata kredytu — zapisywane jako transfer. */
+async function openMoveSheet(id, mode) {
+  const a = accById()[id];
+  if (!a) return;
+  const sources = state.data.accounts.filter((x) => !x.archived && accountGroup(x) === 'current' && x.currency === a.currency);
+  const last = await db.getSetting('lastMoveAccount', undefined);
+  // „tylko zapis” nigdy nie jest zapamiętywane — domyślnie zawsze prawdziwe konto
+  const def = (sources.find((x) => x.id === last) || sources.find((x) => x.type === 'checking') || sources[0])?.id || '';
+  const date = isCurrentMonth() ? todayISO() : `${state.month}-01`;
+  const titles = { in: `Wpłata: ${a.name}`, out: `Wypłata: ${a.name}`, pay: `Spłata: ${a.name}` };
+  const defDesc = { in: 'Wpłata', out: 'Wypłata', pay: 'Spłata kredytu' }[mode];
+  const otherLabel = mode === 'out' ? 'Na które konto trafiają pieniądze' : 'Z którego konta';
+  const none = mode === 'out' ? 'Nie dodawaj do żadnego konta (tylko zapis)' : 'Nie odejmuj z żadnego konta (tylko zapis)';
+  const prefill = mode === 'pay' && a.installment ? minorToInput(a.installment) : '';
+  openSheet(titles[mode], `
+    <label class="field"><span>Kwota</span><input id="mv-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(prefill)}" autocomplete="off"></label>
+    <div class="grid2">
+      <label class="field"><span>Data</span><input id="mv-date" type="date" value="${esc(date)}"></label>
+      <label class="field"><span>Opis</span><input id="mv-desc" maxlength="200" value="${esc(defDesc)}"></label>
+    </div>
+    <label class="field"><span>${otherLabel}</span><select id="mv-other">
+      ${sources.map((x) => `<option value="${esc(x.id)}" ${x.id === def ? 'selected' : ''}>${esc(x.name)}</option>`).join('')}
+      <option value="" ${def === '' ? 'selected' : ''}>${none}</option></select></label>
+    <p class="small muted">${mode === 'pay' ? 'Spłata zmniejsza dług. Nie jest liczona jako wydatek, bo pieniądze nie znikają — spłacasz swój dług.' : 'To przeniesienie Twoich pieniędzy — nie jest liczone jako wydatek ani przychód.'}</p>
+    <div class="err" id="mv-err" role="alert"></div>
+    <div class="actions"><button class="btn primary block" id="mv-save">Zapisz</button></div>`);
+  setTimeout(() => $('#mv-amount').focus(), 50);
+  $('#mv-save').onclick = async () => {
+    const other = $('#mv-other').value || null;
+    const now = new Date().toISOString();
+    const t = {
+      id: db.newId('tx'), createdAt: now, updatedAt: now,
+      type: 'transfer',
+      amount: toMinor($('#mv-amount').value),
+      currency: a.currency,
+      date: $('#mv-date').value,
+      categoryId: null,
+      accountId: mode === 'out' ? a.id : other,
+      toAccountId: mode === 'out' ? other : a.id,
+      toAmount: null,
+      description: $('#mv-desc').value.trim(),
+      tags: [], recurring: false, refund: false,
+    };
+    const errors = validateTransaction(t, state.data);
+    if (errors.length) { $('#mv-err').textContent = errors.join(' · '); return; }
+    await db.put('transactions', t);
+    if (other) await db.setSetting('lastMoveAccount', other);
+    closeSheet();
+    if (monthKey(t.date) !== state.month) state.month = monthKey(t.date);
+    await reload();
+    toast(`Zapisano: ${formatMoney(t.amount, t.currency)}`);
   };
 }
 
@@ -546,8 +775,8 @@ async function openTxSheet(id) {
     amount: existing ? minorToInput(existing.amount) : '',
     date: existing?.date || todayISO(),
     categoryId: existing?.categoryId || null,
-    accountId: existing?.accountId || defAcc,
-    toAccountId: existing?.toAccountId || accounts.find((a) => a.id !== defAcc)?.id || '',
+    accountId: existing ? (existing.accountId || '') : defAcc,
+    toAccountId: existing ? (existing.toAccountId || '') : accounts.find((a) => a.id !== defAcc)?.id || '',
     toAmount: existing?.toAmount != null ? minorToInput(existing.toAmount) : '',
     description: existing?.description || '',
     tags: (existing?.tags || []).join(', '),
@@ -556,7 +785,8 @@ async function openTxSheet(id) {
   };
   // edycja konta zarchiwizowanego: pokaż je na liście
   const accOptions = (sel) => state.data.accounts.filter((a) => !a.archived || a.id === sel)
-    .map((a) => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} (${esc(a.currency)})</option>`).join('');
+    .map((a) => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} (${esc(a.currency)})</option>`).join('')
+    + `<option value="" ${!sel ? 'selected' : ''}>— tylko zapis (poza kontami) —</option>`;
   const recent = existing ? [] : recentTemplates();
 
   openSheet(existing ? 'Edytuj transakcję' : 'Nowa transakcja', `
@@ -612,7 +842,9 @@ async function openTxSheet(id) {
     $('#t-refund-wrap').hidden = f.type !== 'expense';
     $('#t-acc-label').textContent = tr ? 'Z konta' : f.type === 'income' ? 'Na konto' : 'Z konta';
     const ab = accById();
-    $('#t-toamt-wrap').hidden = !(tr && ab[$('#t-acc').value]?.currency !== ab[$('#t-to').value]?.currency);
+    const fa = ab[$('#t-acc').value];
+    const ta = ab[$('#t-to').value];
+    $('#t-toamt-wrap').hidden = !(tr && fa && ta && fa.currency !== ta.currency);
     if (f.categoryId && !cats().some((c) => c.id === f.categoryId)) f.categoryId = null;
     paintCats();
   }
@@ -676,19 +908,19 @@ async function openTxSheet(id) {
     const amount = toMinor($('#t-amount').value);
     const tr = f.type === 'transfer';
     const accs = accById();
-    const acc = accs[$('#t-acc').value];
-    const to = tr ? accs[$('#t-to').value] : null;
+    const acc = accs[$('#t-acc').value] || null;
+    const to = tr ? accs[$('#t-to').value] || null : null;
     const toAmount = tr && to && acc && to.currency !== acc.currency ? toMinor($('#t-toamt').value) : null;
     const now = new Date().toISOString();
     const t = {
       ...(existing || { id: db.newId('tx'), createdAt: now }),
       type: f.type,
       amount,
-      currency: acc?.currency || 'PLN',
+      currency: (acc || to)?.currency || 'PLN',
       date: $('#t-date').value,
       categoryId: tr ? null : f.categoryId,
-      accountId: $('#t-acc').value,
-      toAccountId: tr ? $('#t-to').value : null,
+      accountId: $('#t-acc').value || null,
+      toAccountId: tr ? $('#t-to').value || null : null,
       toAmount: Number.isNaN(toAmount) ? -1 : toAmount,
       description: $('#t-desc').value.trim(),
       tags: $('#t-tags').value.split(',').map((s) => s.trim()).filter(Boolean),
@@ -701,7 +933,7 @@ async function openTxSheet(id) {
     if (errors.length) { $('#t-err').textContent = errors.join(' · '); return; }
     try {
       await db.put('transactions', t);
-      await db.setSetting('lastAccount', t.accountId);
+      if (t.accountId) await db.setSetting('lastAccount', t.accountId);
     } catch (err) {
       $('#t-err').textContent = 'Nie udało się zapisać: ' + err.message;
       return;
@@ -803,9 +1035,14 @@ async function onAction(e) {
     case 'month-next': state.month = addMonths(state.month, 1); render(); break;
     case 'month-today': state.month = monthKey(todayISO()); render(); break;
     case 'tx-filter': state.txFilter = el.dataset.f; render(); break;
-    case 'edit-budget': openBudgetSheet(el.dataset.id); break;
+    case 'add-bill': openBillSheet(null); break;
+    case 'edit-bill': openBillSheet(el.dataset.id); break;
+    case 'toggle-bill': toggleBill(el.dataset.id); break;
+    case 'copy-bills': copyBills(); break;
     case 'edit-account': openAccountSheet(el.dataset.id); break;
-    case 'add-account': openAccountSheet(null); break;
+    case 'add-account': openAccountSheet(null, el.dataset.group); break;
+    case 'account-detail': openAccountDetail(el.dataset.id); break;
+    case 'move': openMoveSheet(el.dataset.id, el.dataset.mode); break;
     case 'categories': openCategoriesSheet(el.dataset.kind); break;
     case 'edit-cat': openCategorySheet(el.dataset.id); break;
     case 'new-cat': openCategorySheet(null, el.dataset.kind); break;

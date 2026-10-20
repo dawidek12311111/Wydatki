@@ -38,4 +38,25 @@ export const ACCOUNT_TYPES = {
   other: 'Inne',
 };
 
+/** Rodzaje oszczędności i inwestycji (pole subtype). type: 'savings' albo 'investment'. */
+export const SAVINGS_KINDS = {
+  deposit: { label: 'Konto oszczędn. / lokata', icon: '🐷', type: 'savings' },
+  ike: { label: 'IKE', icon: '🏛️', type: 'investment' },
+  ikze: { label: 'IKZE', icon: '🧾', type: 'investment' },
+  ppk: { label: 'PPK', icon: '👷', type: 'investment' },
+  etf: { label: 'ETF / fundusze', icon: '📈', type: 'investment' },
+  bonds: { label: 'Obligacje skarbowe', icon: '📜', type: 'investment' },
+  crypto: { label: 'Kryptowaluty', icon: '🪙', type: 'investment' },
+  other: { label: 'Inne', icon: '💰', type: 'investment' },
+};
+
+/** Grupa w zakładce Majątek. */
+export function accountGroup(a) {
+  if (a.type === 'loan') return 'loan';
+  if (a.type === 'savings' || a.type === 'investment') return 'savings';
+  return 'current';
+}
+
+export const BILL_ICONS = ['🏠', '💡', '🔥', '💧', '🗑️', '📱', '🌐', '📺', '🚗', '⛽', '🛡️', '🏦', '💳', '🎓', '🧸', '🏥', '🐶', '🏋️', '🎵', '📦'];
+
 export const CURRENCIES = ['PLN', 'EUR', 'USD', 'GBP', 'CHF'];

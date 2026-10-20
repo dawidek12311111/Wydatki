@@ -1,6 +1,6 @@
 // Service worker: pozwala uruchomić aplikację bez internetu.
 // Przy każdej zmianie plików aplikacji zwiększ VERSION — telefon pobierze nową wersję.
-const VERSION = 'sf-v0.2.1';
+const VERSION = 'sf-v0.3.0';
 const FILES = [
   './', './index.html', './manifest.webmanifest', './style.css',
   './app.js', './db.js', './calc.js', './money.js', './dates.js',

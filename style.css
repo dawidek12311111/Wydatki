@@ -224,3 +224,36 @@ details.more summary { color: var(--accent); font-weight: 600; padding: 8px 0; c
   .fab { bottom: 28px; right: 28px; }
   .toast { bottom: 110px; }
 }
+
+/* v0.3: lista „Do zapłaty” */
+.bill { padding: 0; gap: 0; }
+.bill-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; padding: 12px 6px 12px 14px; background: none; border: 0; text-align: left; min-height: 64px; }
+.bill.is-paid .t1 { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 1px; }
+.paybtn { flex: none; width: 52px; height: 52px; margin-right: 8px; border-radius: 50%; border: 0; font-size: 24px; font-weight: 800; line-height: 1; display: grid; place-items: center; }
+.paybtn.paid { background: color-mix(in srgb, var(--income) 16%, var(--surface)); color: var(--income); }
+.paybtn.unpaid { background: color-mix(in srgb, var(--expense) 13%, var(--surface)); color: var(--expense); }
+.paybtn:active { transform: scale(.92); }
+.track.light { background: rgba(255, 255, 255, .22); margin-top: 12px; }
+.track.light .fill { background: currentColor; }
+.icongrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(44px, 1fr)); gap: 6px; margin-bottom: 8px; }
+.icongrid button { height: 44px; border: 1px solid var(--line); background: var(--bg); border-radius: 10px; font-size: 22px; }
+.icongrid button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.chips.wrap { flex-wrap: wrap; overflow: visible; }
+
+/* v0.3: Majątek — sekcje i karty */
+.sec-head { display: flex; justify-content: space-between; align-items: baseline; margin: 24px 4px 8px; }
+.sec-head h2 { font-size: 17px; margin: 0; }
+.acard { background: var(--surface); border-radius: var(--radius); box-shadow: var(--shadow); padding: 4px 14px 14px; margin: 0 0 10px; }
+.acard-head { display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 0; background: none; border: 0; text-align: left; }
+.acard-head .mid { flex: 1; min-width: 0; }
+.acard-head .t1 { display: block; font-weight: 700; }
+.acard-head .t2 { display: block; font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acard-head .amt { font-weight: 700; font-size: 17px; }
+.acard-month { color: var(--muted); margin: 0 0 10px; }
+.acard-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
+.acard-grid div { background: var(--surface-2); border-radius: 10px; padding: 8px; }
+.acard-grid small { display: block; font-size: 12px; color: var(--muted); }
+.acard-grid b { font-size: 14px; }
+.acard-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.acard-actions.one { grid-template-columns: 1fr; }
+.acard-actions .btn { min-height: 44px; padding: 10px; }

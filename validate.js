@@ -14,18 +14,39 @@ export function validateTransaction(t, { accounts = [], categories = [] } = {}) 
   else if (t.amount > MAX_AMOUNT) errors.push('Kwota jest zbyt duża');
   if (!isValidISODate(t.date)) errors.push('Nieprawidłowa data');
   if (typeof t.currency !== 'string' || !/^[A-Z]{3}$/.test(t.currency)) errors.push('Nieprawidłowa waluta');
-  if (!t.accountId || (accounts.length && !accIds.has(t.accountId))) errors.push('Wybierz konto');
+  const known = (id) => !accounts.length || accIds.has(id);
   if (t.type === 'transfer') {
-    if (!t.toAccountId || (accounts.length && !accIds.has(t.toAccountId))) errors.push('Wybierz konto docelowe');
-    else if (t.toAccountId === t.accountId) errors.push('Konto źródłowe i docelowe muszą być różne');
+    // jedna strona może być „poza aplikacją” (null) — np. wpłata na IKE zapisana bez konta źródłowego
+    const from = t.accountId || null;
+    const to = t.toAccountId || null;
+    if (!from && !to) errors.push('Wybierz konto');
+    if (from && !known(from)) errors.push('Nieznane konto źródłowe');
+    if (to && !known(to)) errors.push('Nieznane konto docelowe');
+    if (from && to && from === to) errors.push('Konto źródłowe i docelowe muszą być różne');
     if (t.toAmount != null && (!Number.isInteger(t.toAmount) || t.toAmount <= 0)) errors.push('Nieprawidłowa kwota docelowa');
-  } else if (t.categoryId && categories.length) {
+  } else if (!t.accountId || !known(t.accountId)) {
+    errors.push('Wybierz konto');
+  }
+  if (t.type !== 'transfer' && t.categoryId && categories.length) {
     const cat = categories.find((c) => c.id === t.categoryId);
     if (!cat) errors.push('Nieznana kategoria');
     else if (cat.kind !== t.type) errors.push('Kategoria nie pasuje do typu transakcji');
   }
   if (t.description != null && (typeof t.description !== 'string' || t.description.length > 200)) errors.push('Opis może mieć maks. 200 znaków');
   if (t.tags != null && (!Array.isArray(t.tags) || t.tags.some((x) => typeof x !== 'string'))) errors.push('Nieprawidłowe tagi');
+  return errors;
+}
+
+/** Pozycja listy „Do zapłaty”. */
+export function validateBill(b) {
+  const errors = [];
+  if (!b || typeof b !== 'object') return ['Brak danych'];
+  if (typeof b.name !== 'string' || !b.name.trim()) errors.push('Wpisz, co trzeba zapłacić');
+  else if (b.name.length > 80) errors.push('Opis może mieć maks. 80 znaków');
+  if (!Number.isInteger(b.amount) || b.amount <= 0) errors.push('Kwota musi być większa od zera');
+  else if (b.amount > MAX_AMOUNT) errors.push('Kwota jest zbyt duża');
+  if (typeof b.month !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(b.month)) errors.push('Nieprawidłowy miesiąc');
+  if (typeof b.paid !== 'boolean') errors.push('Nieprawidłowy status');
   return errors;
 }
 
@@ -47,6 +68,10 @@ export function validateBackup(data) {
     if (validateTransaction(t, { accounts: data.accounts, categories: data.categories }).length) bad++;
   }
   if (bad) errors.push(`${bad} transakcji ma nieprawidłowe dane`);
+  if (data.bills != null) {
+    if (!Array.isArray(data.bills) || !ids(data.bills)) errors.push('Uszkodzona lista „Do zapłaty”');
+    else if (data.bills.some((b) => validateBill(b).length)) errors.push('Nieprawidłowe pozycje na liście „Do zapłaty”');
+  }
   return {
     ok: errors.length === 0,
     errors,

@@ -1,6 +1,6 @@
 # Smart Finance
 
-Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.2.0 — MVP**.
+Prywatna aplikacja do budżetu domowego na telefon (PWA). Wersja **0.3.0**.
 Dane zapisują się **tylko w Twoim telefonie** — nic nie trafia na serwer.
 
 Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
@@ -10,8 +10,10 @@ Plan techniczny i kolejne etapy: [docs/PLAN.md](docs/PLAN.md)
 - Dodawanie przychodów, wydatków i transferów; szybki tekst („Paliwo 250 zł dzisiaj”); ostatnie operacje jednym dotknięciem
 - Zwroty, tagi, oznaczenie „cykliczna”, inne waluty (zapisywane osobno, bez przeliczania)
 - Kategorie i podkategorie (edycja, ukrywanie, słowa kluczowe)
-- Konta z saldem początkowym, majątek netto (aktywa − zobowiązania)
-- Budżety kategorii: „co miesiąc” lub „tylko ten miesiąc”
+- Budżet = lista „Do zapłaty” na każdy miesiąc: opis, kwota, ikona, ✓ zapłacone / ✕ niezapłacone, kopiowanie listy z poprzedniego miesiąca
+- Majątek: oszczędności i inwestycje (lokata, IKE, IKZE, PPK, ETF, obligacje, krypto, inne) z opisem, sumą, wpłatą i wypłatą
+- Kredyty: spłaty, stan przed/po w danym miesiącu, postęp spłaty
+- Konta bieżące z saldem początkowym, majątek netto (aktywa − zobowiązania)
 - Analityka: 6 miesięcy na wykresie, średnie 3/6/12 mies., porównanie z poprzednim miesiącem i rokiem wcześniej
 - Kopia zapasowa JSON, przywracanie, eksport CSV (polski Excel), kosz z „Cofnij”
 - Jasny/ciemny motyw, działa offline, instalacja na Androidzie

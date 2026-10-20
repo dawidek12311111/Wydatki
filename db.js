@@ -3,9 +3,10 @@
 import { DEFAULT_CATEGORIES, DEFAULT_ACCOUNTS } from './defaults.js';
 
 const DB_NAME = 'smart-finance';
-const DB_VERSION = 1;
-export const SCHEMA_VERSION = 1;
-const STORES = ['accounts', 'categories', 'transactions', 'budgets', 'settings'];
+const DB_VERSION = 2; // 2: lista „Do zapłaty” (bills)
+export const SCHEMA_VERSION = 2;
+const STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills', 'settings'];
+const DATA_STORES = ['accounts', 'categories', 'transactions', 'budgets', 'bills'];
 
 let dbPromise;
 
@@ -82,9 +83,8 @@ export async function ensureDefaults() {
 }
 
 export async function loadAll() {
-  const [accounts, categories, transactions, budgets] = await Promise.all(
-    ['accounts', 'categories', 'transactions', 'budgets'].map(getAll));
-  return { accounts, categories, transactions, budgets };
+  const [accounts, categories, transactions, budgets, bills] = await Promise.all(DATA_STORES.map(getAll));
+  return { accounts, categories, transactions, budgets, bills };
 }
 
 export async function exportBackup() {
@@ -96,11 +96,10 @@ export async function exportBackup() {
 /** Zastępuje wszystkie dane zawartością kopii (wywoływać dopiero po validateBackup i potwierdzeniu). */
 export async function restoreBackup(data) {
   const db = await open();
-  const names = ['accounts', 'categories', 'transactions', 'budgets', 'settings'];
-  const tx = db.transaction(names, 'readwrite');
-  for (const n of names) tx.objectStore(n).clear();
-  for (const n of ['accounts', 'categories', 'transactions', 'budgets']) {
-    for (const item of data[n]) tx.objectStore(n).put(item);
+  const tx = db.transaction(STORES, 'readwrite');
+  for (const n of STORES) tx.objectStore(n).clear();
+  for (const n of DATA_STORES) {
+    for (const item of data[n] || []) tx.objectStore(n).put(item); // starsze kopie nie mają „bills”
   }
   for (const s of data.settings || []) if (s && typeof s.id === 'string') tx.objectStore('settings').put(s);
   tx.objectStore('settings').put({ id: 'initialized', value: new Date().toISOString() });
