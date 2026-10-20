@@ -53,8 +53,17 @@ export function accountValue(account, transactions, { asOf = END, prices = null,
   const metal = metalOf(account);
   if (metal && prices) {
     const p = asOf >= today ? prices[metal]?.pln : priceAt(prices.history?.[metal], asOf)?.pln;
-    const v = metalValue(account, p);
+    const pos = Array.isArray(account.positions) && account.positions.length ? account.positions : null;
+    const v = pos ? (p > 0 ? pos.reduce((s, x) => s + metalValue(x, p), 0) : null) : metalValue(account, p);
     if (v != null) return v;
+  }
+  if (account.subtype === 'crypto' && prices && asOf >= today && Array.isArray(account.positions) && account.positions.length) {
+    let sum = 0;
+    for (const x of account.positions) {
+      const price = x.coin ? prices.crypto?.[x.coin]?.pln : null;
+      sum += price > 0 ? Math.round(Number(x.amount || 0) * price * 100) : (Number.isInteger(x.manualValue) ? x.manualValue : (x.paid || 0));
+    }
+    return sum;
   }
   return bookBalance(account, transactions, asOf) + valuationAdjustment(account, transactions, asOf);
 }
@@ -102,3 +111,52 @@ export function mergeHistory(history, entries, max = 800) {
   for (const e of entries || []) if (e && e.date && e.pln > 0) map.set(e.date, { date: e.date, pln: e.pln });
   return [...map.values()].sort((a, b) => a.date.localeCompare(b.date)).slice(-max);
 }
+
+// ---------- Pozycje w koncie (złoto: monety/sztabki/biżuteria; krypto: BTC/ETH/…) ----------
+
+export const isCrypto = (a) => a?.subtype === 'crypto';
+export const hasPositions = (a) => !!(metalOf(a) || isCrypto(a));
+
+/** Pozycje konta. Stare konto ze złotem bez pozycji = jedna pozycja z danymi konta. */
+export function positionsOf(a) {
+  if (Array.isArray(a.positions) && a.positions.length) return a.positions;
+  if (metalOf(a) && Number(a.grams) > 0) {
+    return [{ id: 'p0', name: METALS[metalOf(a)], grams: Number(a.grams), purity: a.purity || 1, spread: a.spread || 0, paid: a.openingBalance || 0 }];
+  }
+  return [];
+}
+
+/** Wartość jednej pozycji (grosze) albo null, gdy brak ceny. */
+export function positionValue(a, p, prices) {
+  const metal = metalOf(a);
+  if (metal) return metalValue(p, prices?.[metal]?.pln);
+  if (isCrypto(a)) {
+    const price = p.coin ? prices?.crypto?.[p.coin]?.pln : null;
+    if (price > 0) return Math.round(Number(p.amount || 0) * price * 100);
+    return Number.isInteger(p.manualValue) ? p.manualValue : null;
+  }
+  return null;
+}
+
+/** Podsumowanie pozycji: wartość, wpłacono, zysk i udział każdej. */
+export function positionsSummary(a, prices) {
+  const list = positionsOf(a).map((p) => {
+    const value = positionValue(a, p, prices);
+    const v = value ?? p.paid ?? 0;
+    return { ...p, value: v, priced: value != null, gain: v - (p.paid || 0) };
+  });
+  const total = list.reduce((s, p) => s + p.value, 0);
+  const paid = list.reduce((s, p) => s + (p.paid || 0), 0);
+  const grams = list.reduce((s, p) => s + (Number(p.grams) || 0), 0);
+  return { list: list.map((p) => ({ ...p, share: total > 0 ? p.value / total : 0 })), total, paid, grams, allPriced: list.every((p) => p.priced) };
+}
+
+/** Kupno / sprzedaż w pozycji: zmienia ilość i „wpłacono” (przy sprzedaży proporcjonalnie). */
+export function applyTrade(position, { qty, amount, sell = false, field = 'grams' }) {
+  const cur = Number(position[field]) || 0;
+  if (!sell) return { ...position, [field]: round4(cur + qty), paid: (position.paid || 0) + amount };
+  const q = Math.min(qty, cur);
+  const ratio = cur > 0 ? q / cur : 0;
+  return { ...position, [field]: round4(cur - q), paid: Math.round((position.paid || 0) * (1 - ratio)) };
+}
+const round4 = (x) => Math.round(x * 1e8) / 1e8;

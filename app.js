@@ -16,13 +16,14 @@ import { hashPin, verifyPin, lockoutSeconds, PIN_RE, biometricAvailable, registe
 import { speechSupported, listen } from './voice.js';
 import { kindOf, paidWithoutTx, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
 import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS, loanInstallment } from './purchases.js';
-import { metalOf, accountValue, bookBalance, investmentResult, valuedNetWorth, applyChange, sortedValuations, metalValue, TROY_OUNCE_G } from './valuation.js';
-import { refreshPrices } from './prices.js';
+import { isCrypto, hasPositions, positionsOf, positionsSummary, applyTrade, metalOf, accountValue, bookBalance, investmentResult, valuedNetWorth, applyChange, sortedValuations, metalValue, TROY_OUNCE_G } from './valuation.js';
+import { refreshPrices, fetchCryptoPrices, searchCoins } from './prices.js';
+import { parseBatch } from './batch.js';
 import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.8.0';
+export const APP_VERSION = '0.9.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -32,6 +33,7 @@ const state = {
   data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
   plansTab: 'buy',
   prices: null,
+  openPos: {},
   profile: null,
   deletedAccounts: [],
   bioAvailable: false,
@@ -212,7 +214,8 @@ function viewDashboard() {
     quick: () => `<section class="card" ${lp('quick')}><h2>Szybkie dodawanie</h2>
       <div class="qa"><input id="dash-quick" placeholder="np. Biedronka 87,40" autocomplete="off" enterkeyhint="go" aria-label="Szybkie dodawanie">
       ${speechSupported() ? '<button class="mic" data-action="dash-mic" aria-label="Dyktuj">🎤</button>' : ''}
-      <button class="btn primary" data-action="quick-add">Dalej</button></div></section>`,
+      <button class="btn primary" data-action="quick-add">Dalej</button></div>
+      <button class="btn block" data-action="batch" style="margin-top:8px">⚡ Szybka aktualizacja — kilka rzeczy naraz</button></section>`,
 
     networth: () => {
       const w = valuedNetWorth(state.data.accounts, txs, valOpts());
@@ -229,7 +232,7 @@ function viewDashboard() {
       const ps = planSummary(state.data.bills, state.month);
       const open = billsOfMonth().filter((b) => !b.paid);
       const count = ps.income.count + ps.expense.count;
-      return `<section class="card" ${lp('bills')}><h2>Plan miesiąca <a href="#budget">Plan ›</a></h2>
+      return `<section class="card" ${lp('bills')}><h2>Plan miesiąca <span><button class="link" data-action="batch">⚡ Szybko</button> · <a href="#budget">Plan ›</a></span></h2>
         ${count ? `<div class="stat-row">
           <div class="stat"><small>Wpłynęło</small><b class="pos">${money(ps.income.done)}</b><small>z ${esc(formatMoney(ps.income.total))}</small></div>
           <div class="stat"><small>Do zapłaty</small><b class="${ps.expense.left > 0 ? 'neg' : 'pos'}">${money(ps.expense.left)}</b><small>${ps.expense.doneCount}/${ps.expense.count} opłacone</small></div>
@@ -402,7 +405,8 @@ function viewBudget() {
       <div class="foot">Tyle zostanie po planowanych opłatach. Na dziś: <b class="num">${esc(formatMoney(s.doneNet, 'PLN', { sign: true }))}</b></div>
     </section>
     ${missingTxNotice(ym)}
-    ${toCopy.length ? `<button class="btn primary block" data-action="copy-bills">⧉ Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
+    <button class="btn block" data-action="batch">⚡ Szybka aktualizacja — „wpłynęła wypłata 9k, ppk 300…”</button>
+    ${toCopy.length ? `<button class="btn primary block" data-action="copy-bills" style="margin-top:8px">⧉ Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
     ${section('income', incomes, 'Wpływy', s.income.done, s.income.total)}
     ${section('expense', expenses, 'Do zapłaty', s.expense.done, s.expense.total)}
     <p class="note">Dotknij ✕ / ✓, żeby zmienić status${autoTxOn() ? ' — odhaczenie od razu dodaje transakcję (przychód lub wydatek), odznaczenie ją usuwa' : ''}. Nazwa miesiąca u góry otwiera kalendarz, strzałki przenoszą na kolejny miesiąc.</p>`;
@@ -655,22 +659,26 @@ function viewWealth() {
 
   const savingsCards = savings.map((a) => {
     const m = accountMonth(a, txs, ym);
-    const r = investmentResult(a, txs, valOpts(lastDay(ym)));
     const metal = metalOf(a);
-    const showGain = metal || (a.valuations || []).length > 0;
+    const r = posResult(a, investmentResult(a, txs, valOpts(lastDay(ym))));
+    const crypto = isCrypto(a);
+    const posMode = metal || (crypto && positionsOf(a).length);
+    const showGain = metal || posMode || (a.valuations || []).length > 0;
     return `<section class="acard" data-lp="acc:${esc(a.id)}">
       <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
         <span class="ico">${accIco(a)}</span>
         <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
         <span class="amt num">${esc(formatMoney(r.value, a.currency))}</span>
       </button>
-      ${metal ? `<div class="acard-month small">${metalLine(a)}</div>` : ''}
+      ${metal ? `<div class="acard-month small">${positionsOf(a).length > 1 ? metalPriceOnly(a) : metalLine(a)}</div>` : ''}
+      ${crypto && positionsOf(a).length ? `<div class="acard-month small">${cryptoLine(a)}</div>` : ''}
       ${showGain ? `<div class="acard-month small">Wpłacono <span class="num">${esc(formatMoney(r.paidIn, a.currency))}</span> · ${r.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${r.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(r.gain, a.currency, { sign: true }))}${r.gainPct != null ? ` (${esc(fmtPct(r.gainPct * 100))})` : ''}</b></div>` : ''}
       <div class="acard-month small">${m.inflow || m.outflow ? `W tym miesiącu:${m.inflow ? ` <span class="pos num">wpłaty +${esc(formatMoney(m.inflow, a.currency))}</span>` : ''}${m.inflow && m.outflow ? ' ·' : ''}${m.outflow ? ` <span class="neg num">wypłaty −${esc(formatMoney(m.outflow, a.currency))}</span>` : ''}` : 'Brak wpłat i wypłat w tym miesiącu'}</div>
-      <div class="acard-actions ${metal ? '' : 'three'}">
-        <button class="btn" data-action="move" data-mode="in" data-id="${esc(a.id)}">${metal ? '+ Kupno' : '+ Wpłata'}</button>
-        <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">${metal ? '− Sprzedaż' : '− Wypłata'}</button>
-        ${metal ? '' : `<button class="btn" data-action="valuate" data-id="${esc(a.id)}">📈 Wartość</button>`}
+      ${metal || crypto ? positionsHtml(a) : ''}
+      <div class="acard-actions ${posMode ? '' : 'three'}">
+        <button class="btn" data-action="move" data-mode="in" data-id="${esc(a.id)}">${posMode ? '+ Kupno' : '+ Wpłata'}</button>
+        <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">${posMode ? '− Sprzedaż' : '− Wypłata'}</button>
+        ${posMode ? '' : `<button class="btn" data-action="valuate" data-id="${esc(a.id)}">📈 Wartość</button>`}
       </div>
     </section>`;
   }).join('');
@@ -894,6 +902,7 @@ function openAccountSheet(id, group) {
     await reload();
     toast('Zapisano');
     if (metalOf(item)) refreshMetalPrices({ force: !state.prices?.[metalOf(item)] });
+    if (!a && (metalOf(item) || isCrypto(item)) && !positionsOf(item).length) { state.openPos = { ...state.openPos, [item.id]: true }; openPositionSheet(item.id); }
   };
 }
 
@@ -907,7 +916,7 @@ function openAccountDetail(id) {
   const bookNow = balances([a], liveTx())[id];
   const isLoan = a.type === 'loan';
   const isProp = accountGroup(a) === 'property';
-  const inv = accountGroup(a) === 'savings' || isProp ? investmentResult(a, liveTx(), valOpts()) : null;
+  const inv = accountGroup(a) === 'savings' || isProp ? posResult(a, investmentResult(a, liveTx(), valOpts())) : null;
   const bal = inv ? inv.value : bookNow;
   openSheet(a.name, `
     <p class="muted small" style="margin-top:0">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</p>
@@ -917,7 +926,8 @@ function openAccountDetail(id) {
     </div>
     ${isProp && a.purchasePrice ? `<p class="small" style="margin:10px 4px 0">Kupione za <span class="num">${esc(formatMoney(a.purchasePrice, a.currency))}</span>${a.purchaseYear ? ` (${a.purchaseYear})` : ''} · zmiana <b class="num ${inv.value - a.purchasePrice >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.value - a.purchasePrice, a.currency, { sign: true }))}</b></p>` : ''}
     ${inv && !isProp && (metalOf(a) || (a.valuations || []).length) ? `<p class="small" style="margin:10px 4px 0">Wpłacono <span class="num">${esc(formatMoney(inv.paidIn, a.currency))}</span> · ${inv.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${inv.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.gain, a.currency, { sign: true }))}${inv.gainPct != null ? ` (${esc(fmtPct(inv.gainPct * 100))})` : ''}</b></p>` : ''}
-    ${metalOf(a) ? `<p class="small muted" style="margin:6px 4px 0">${metalLine(a)}</p>` : ''}
+    ${metalOf(a) && positionsOf(a).length <= 1 ? `<p class="small muted" style="margin:6px 4px 0">${metalLine(a)}</p>` : ''}
+    ${metalOf(a) || isCrypto(a) ? `<div style="margin-top:10px">${positionsHtml(a).replace('<details class="pos"', '<details class="pos" open')}</div>` : ''}
     ${inv ? valuationHistoryHtml(a) : ''}
     ${inv && !metalOf(a) ? `<div class="actions"><button class="btn primary block" data-action="valuate" data-id="${esc(id)}">📈 Aktualizuj wartość</button></div>` : ''}
     <h3 class="small muted" style="margin:16px 4px 6px">Wpłaty i wypłaty</h3>
@@ -941,15 +951,21 @@ async function openMoveSheet(id, mode) {
   const def = (sources.find((x) => x.id === last) || sources.find((x) => x.type === 'checking') || sources[0])?.id || '';
   const date = isCurrentMonth() ? todayISO() : `${state.month}-01`;
   const metal = metalOf(a);
-  const titles = metal ? { in: `Kupno: ${a.name}`, out: `Sprzedaż: ${a.name}` } : { in: `Wpłata: ${a.name}`, out: `Wypłata: ${a.name}`, pay: `Spłata: ${a.name}` };
-  const defDesc = metal ? { in: 'Kupno', out: 'Sprzedaż' }[mode] : { in: 'Wpłata', out: 'Wypłata', pay: 'Spłata kredytu' }[mode];
+  const crypto = isCrypto(a) && positionsOf(a).length > 0;
+  const posList = metal || crypto ? positionsOf(a) : [];
+  const posSel = posList.length ? `<label class="field"><span>Pozycja</span><select id="mv-pos">${posList.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')}${mode === 'in' ? '<option value="__new">+ Nowa pozycja…</option>' : ''}</select></label>
+      <label class="field" id="mv-newname-wrap" hidden><span>Nazwa nowej pozycji</span><input id="mv-newname" maxlength="40" placeholder="np. Monety"></label>` : '';
+  const titles = metal || crypto ? { in: `Kupno: ${a.name}`, out: `Sprzedaż: ${a.name}` } : { in: `Wpłata: ${a.name}`, out: `Wypłata: ${a.name}`, pay: `Spłata: ${a.name}` };
+  const defDesc = metal || crypto ? { in: 'Kupno', out: 'Sprzedaż' }[mode] : { in: 'Wpłata', out: 'Wypłata', pay: 'Spłata kredytu' }[mode];
   const otherLabel = mode === 'out' ? 'Na które konto trafiają pieniądze' : 'Z którego konta';
   const none = mode === 'out' ? 'Nie dodawaj do żadnego konta (tylko zapis)' : 'Nie odejmuj z żadnego konta (tylko zapis)';
   const prefill = mode === 'pay' && a.installment ? minorToInput(a.installment) : '';
   openSheet(titles[mode], `
-    <label class="field"><span>${metal ? (mode === 'in' ? 'Ile zapłaciłeś' : 'Ile dostałeś') : 'Kwota'}</span><input id="mv-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(prefill)}" autocomplete="off"></label>
+    ${posSel}
+    <label class="field"><span>${metal || crypto ? (mode === 'in' ? 'Ile zapłaciłeś' : 'Ile dostałeś') : 'Kwota'}</span><input id="mv-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(prefill)}" autocomplete="off"></label>
     ${metal ? `<div class="grid2"><label class="field"><span>${mode === 'in' ? 'Ile kupiłeś' : 'Ile sprzedałeś'}</span><input id="mv-grams" inputmode="decimal" placeholder="np. 31,1"></label>
       <label class="field"><span>Jednostka</span><select id="mv-unit"><option value="g">gramy</option><option value="oz">uncje</option></select></label></div>` : ''}
+    ${crypto ? `<label class="field"><span>${mode === 'in' ? 'Ile kupiłeś' : 'Ile sprzedałeś'} (sztuk)</span><input id="mv-qty" inputmode="decimal" placeholder="np. 0,01"></label>` : ''}
     <div class="grid2">
       <label class="field"><span>Data</span><input id="mv-date" type="date" value="${esc(date)}"></label>
       <label class="field"><span>Opis</span><input id="mv-desc" maxlength="200" value="${esc(defDesc)}"></label>
@@ -961,6 +977,7 @@ async function openMoveSheet(id, mode) {
     <div class="err" id="mv-err" role="alert"></div>
     <div class="actions"><button class="btn primary block" id="mv-save">Zapisz</button></div>`);
   focusLater('#mv-amount');
+  $('#mv-pos')?.addEventListener('change', (e) => { $('#mv-newname-wrap').hidden = e.target.value !== '__new'; });
   $('#mv-save').onclick = async () => {
     const other = $('#mv-other').value || null;
     const now = new Date().toISOString();
@@ -985,8 +1002,24 @@ async function openMoveSheet(id, mode) {
       if (!Number.isFinite(grams) || grams < 0) { $('#mv-err').textContent = 'Nieprawidłowa ilość.'; return; }
       if ($('#mv-unit').value === 'oz') grams *= TROY_OUNCE_G;
     }
+    let qty = 0;
+    if (crypto) {
+      qty = Number(($('#mv-qty').value || '0').replace(/\s/g, '').replace(',', '.'));
+      if (!Number.isFinite(qty) || qty < 0) { $('#mv-err').textContent = 'Nieprawidłowa ilość.'; return; }
+    }
+    let pid = $('#mv-pos')?.value || null;
+    if (pid === '__new' && !$('#mv-newname').value.trim()) { $('#mv-err').textContent = 'Wpisz nazwę nowej pozycji.'; return; }
     await db.put('transactions', t);
-    if (metal && grams) {
+    if (posList.length && (grams || qty)) {
+      let list = positionsOf(a);
+      if (pid === '__new') {
+        const np = { id: db.newId('pos'), name: $('#mv-newname').value.trim(), paid: 0, ...(metal ? { grams: 0, purity: 0.9999, spread: 0 } : { amount: 0, coin: null, symbol: '' }) };
+        list = [...list, np];
+        pid = np.id;
+      }
+      list = list.map((p) => (p.id === pid ? applyTrade(p, { qty: metal ? grams : qty, amount: t.amount, sell: mode === 'out', field: metal ? 'grams' : 'amount' }) : p));
+      await savePositions(a, list);
+    } else if (metal && grams) {
       const g = Math.max(0, Math.round(((Number(a.grams) || 0) + (mode === 'out' ? -grams : grams)) * 10000) / 10000);
       await db.put('accounts', { ...a, grams: g });
     }
@@ -1821,6 +1854,11 @@ const PURITIES = [
   [0.925, '925 (srebro próby 925)'], [0.9, '900 (stare monety)'], [0.8, '800'], [0.75, '750 (18 karatów)'], [0.585, '585 (14 karatów)'],
 ];
 
+function metalPriceOnly(a) {
+  const p = state.prices?.[metalOf(a)];
+  return p?.pln ? `Cena: <span class="num">${esc(formatMoney(Math.round(p.pln * 100)))}</span>/g <span class="muted">(${esc(p.source)}, ${esc(formatDatePL(p.date))})</span>` : '<span class="neg">brak ceny — odśwież ceny</span>';
+}
+
 function metalLine(a) {
   const metal = metalOf(a);
   const p = state.prices?.[metal];
@@ -1881,11 +1919,17 @@ async function refreshMetalPrices({ force = false, silent = true } = {}) {
   if (!navigator.onLine) { if (!silent) toast('Brak internetu — pokazuję ostatnie znane ceny'); return; }
   state.pricesBusy = true;
   try {
-    const { prices, problems } = await refreshPrices(state.prices || {}, { withHistory: state.prices?.goldHistoryAt !== todayISO() });
+    let prices = state.prices || {};
+    let problems = [];
+    if (hasMetals()) ({ prices, problems } = await refreshPrices(prices, { withHistory: prices?.goldHistoryAt !== todayISO() }));
+    const coins = state.data.accounts.filter((a) => !a.archived && isCrypto(a)).flatMap((a) => positionsOf(a).map((p) => p.coin)).filter(Boolean);
+    if (coins.length) {
+      try { prices = { ...prices, crypto: { ...(prices.crypto || {}), ...(await fetchCryptoPrices(coins, cgKey())) }, updatedAt: new Date().toISOString() }; } catch (e) { problems = [...problems, `krypto: ${e.message}`]; }
+    }
     state.prices = prices;
     state.priceProblems = problems;
     await db.setSetting('metalPrices', prices);
-    if (!$('#sheet').open || !silent) render();
+    render(); // widok pod okienkiem — otwarte okienko zostaje nietknięte
     if (!silent) toast(problems.length ? 'Część cen nie została pobrana' : 'Zaktualizowano ceny metali');
   } finally {
     state.pricesBusy = false;
@@ -2153,6 +2197,234 @@ function bindSimForm() {
   form.onchange = onChange;
 }
 
+// ---------- Pozycje: złoto/srebro (monety, sztabki, biżuteria) i krypto (BTC, ETH…) ----------
+const POS_PRESETS = {
+  metal: [['Monety', 0.9167, 3], ['Sztabki', 0.9999, 0], ['Biżuteria', 0.585, 15], ['Inne', 0.9999, 0]],
+};
+const fmtQty = (x) => (Math.round((Number(x) || 0) * 1e8) / 1e8).toLocaleString('pl-PL', { maximumFractionDigits: 8 });
+const cgKey = () => getPref('sf-cg-key', '');
+const hasCrypto = () => state.data.accounts.some((a) => !a.archived && isCrypto(a) && positionsOf(a).some((p) => p.coin));
+
+function positionsHtml(a) {
+  const s = positionsSummary(a, state.prices);
+  if (!s.list.length) {
+    return `<div class="pos-empty small muted">Brak pozycji. <button class="link" data-action="pos-add" data-id="${esc(a.id)}">+ Dodaj ${metalOf(a) ? 'pozycję (np. monety, sztabki)' : 'kryptowalutę'}</button></div>`;
+  }
+  const metal = metalOf(a);
+  return `<details class="pos" ${state.openPos?.[a.id] ? 'open' : ''} data-pos="${esc(a.id)}"><summary>
+      <span>${s.list.length} ${s.list.length === 1 ? 'pozycja' : s.list.length < 5 ? 'pozycje' : 'pozycji'}${metal ? ` · ${fmtGrams(s.grams)}` : ''}</span><span class="chev">▸</span></summary>
+    <ul class="pos-list">${s.list.map((p) => {
+      const qty = metal ? `${fmtGrams(p.grams)} · próba ${String(Math.round((p.purity || 1) * 10000) / 10).replace('.', ',')}${p.spread ? ` · skup −${String(p.spread).replace('.', ',')}%` : ''}`
+        : `${fmtQty(p.amount)} ${esc(p.symbol || '')}${p.coin ? '' : ' · <span class="muted">wycena ręczna</span>'}`;
+      return `<li><button class="pos-row" data-action="pos-edit" data-id="${esc(a.id)}" data-pid="${esc(p.id)}">
+        <span class="mid"><span class="t1">${esc(p.name)}</span><span class="t2">${qty}</span></span>
+        <span class="r"><b class="num">${esc(formatMoney(p.value, a.currency))}</b>
+          <small class="num ${p.gain >= 0 ? 'pos' : 'neg'}">${p.paid ? esc(formatMoney(p.gain, a.currency, { sign: true })) : ''} · ${Math.round(p.share * 100)}%</small></span>
+      </button></li>`;
+    }).join('')}</ul>
+    <button class="btn block small-btn" data-action="pos-add" data-id="${esc(a.id)}">+ Dodaj ${metal ? 'pozycję' : 'kryptowalutę'}</button>
+  </details>`;
+}
+
+/** Dla kont z pozycjami „wpłacono” = suma kwot zapłaconych za pozycje (jeśli wpisane). */
+function posResult(a, r) {
+  if (!hasPositions(a) || !positionsOf(a).length) return r;
+  const s = positionsSummary(a, state.prices);
+  if (!s.paid) return r;
+  const gain = r.value - s.paid;
+  return { ...r, paidIn: s.paid, gain, gainPct: s.paid > 0 ? gain / s.paid : null };
+}
+
+function cryptoLine(a) {
+  const ids = positionsOf(a).filter((p) => p.coin);
+  if (!ids.length) return '';
+  const at = Object.values(state.prices?.crypto || {})[0]?.at;
+  return `Ceny: CoinGecko${at ? `, ${esc(formatDatePL(at.slice(0, 10)))} ${at.slice(11, 16)}` : ' — <span class="neg">brak, odśwież</span>'}`;
+}
+
+function openPositionSheet(accId, posId = null) {
+  const a = accById()[accId];
+  if (!a) return;
+  const metal = metalOf(a);
+  const list = positionsOf(a);
+  const p = posId ? list.find((x) => x.id === posId) : null;
+  let coin = p?.coin ? { id: p.coin, symbol: p.symbol, name: p.name } : null;
+  const mi = (v) => (v ? esc(minorToInput(v)) : '');
+  const body = metal ? `
+    ${p ? '' : `<div class="chips wrap" id="ps-presets">${POS_PRESETS.metal.map(([n]) => `<button type="button" class="chip" data-preset="${esc(n)}">${esc(n)}</button>`).join('')}</div>`}
+    <label class="field"><span>Nazwa pozycji</span><input id="ps-name" maxlength="40" value="${esc(p?.name || '')}" placeholder="np. Monety, Sztabki, Biżuteria"></label>
+    <div class="grid2"><label class="field"><span>Ilość</span><input id="ps-qty" inputmode="decimal" value="${p ? esc(String(p.grams).replace('.', ',')) : ''}" placeholder="np. 5"></label>
+      <label class="field"><span>Jednostka</span><select id="ps-unit"><option value="g">gramy</option><option value="oz">uncje (31,1 g)</option></select></label></div>
+    <div class="grid2"><label class="field"><span>Próba</span><select id="ps-purity">${PURITIES.map(([v, l]) => `<option value="${v}" ${(p?.purity || 0.9999) === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+      <label class="field"><span>Cena skupu − %</span><input id="ps-spread" inputmode="decimal" value="${p?.spread ? esc(String(p.spread).replace('.', ',')) : ''}" placeholder="np. 3"></label></div>`
+    : `
+    <label class="field"><span>Kryptowaluta</span><div class="qa"><input id="ps-coinq" placeholder="np. bitcoin, ETH, solana" autocomplete="off" value="${esc(coin ? `${coin.name} (${coin.symbol})` : '')}"><button type="button" class="btn" id="ps-coingo">Szukaj</button></div></label>
+    <div id="ps-coins" class="chips wrap"></div>
+    <label class="field"><span>Nazwa</span><input id="ps-name" maxlength="40" value="${esc(p?.name || '')}" placeholder="np. Bitcoin"></label>
+    <label class="field"><span>Ilość</span><input id="ps-qty" inputmode="decimal" value="${p ? esc(String(p.amount).replace('.', ',')) : ''}" placeholder="np. 0,05"></label>
+    <label class="field" id="ps-manual-wrap"><span>Wartość teraz (gdy nie ma ceny z CoinGecko)</span><input id="ps-manual" inputmode="decimal" value="${mi(p?.manualValue)}" placeholder="opcjonalnie"></label>`;
+  openSheet(p ? `${p.name}` : `Nowa pozycja: ${a.name}`, `${body}
+    <label class="field"><span>Ile za to zapłaciłeś (łącznie)</span><input id="ps-paid" inputmode="decimal" value="${mi(p?.paid)}" placeholder="0,00"></label>
+    <p class="small muted">To tylko zapis w majątku. Jeśli pieniądze zeszły z konta, użyj na karcie „+ Kupno” — wtedy powstanie też przelew.</p>
+    <div class="err" id="ps-err" role="alert"></div>
+    <div class="actions ${p ? 'two' : ''}">${p ? '<button class="btn danger" id="ps-del">Usuń</button>' : ''}<button class="btn primary block" id="ps-save">Zapisz</button></div>`);
+  const sheet = $('#sheet');
+  sheet.querySelector('#ps-presets')?.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-preset]');
+    if (!b) return;
+    const [n, pur, spr] = POS_PRESETS.metal.find((x) => x[0] === b.dataset.preset);
+    $('#ps-name').value = n;
+    $('#ps-purity').value = String(pur);
+    $('#ps-spread').value = spr ? String(spr) : '';
+    sheet.querySelectorAll('#ps-presets [data-preset]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    $('#ps-qty').focus();
+  });
+  if (!metal) {
+    const paintManual = () => { $('#ps-manual-wrap').hidden = !!coin; };
+    paintManual();
+    const search = async () => {
+      const box = $('#ps-coins');
+      box.innerHTML = '<span class="small muted">Szukam…</span>';
+      try {
+        const res = await searchCoins($('#ps-coinq').value, cgKey());
+        box.innerHTML = res.length ? res.map((c, i) => `<button type="button" class="chip" data-coin="${i}">${esc(c.symbol)} · ${esc(c.name)}</button>`).join('') + '<button type="button" class="chip" data-coin="none">Bez ceny (wycena ręczna)</button>'
+          : '<span class="small muted">Nic nie znaleziono.</span>';
+        box.onclick = (e) => {
+          const b = e.target.closest('[data-coin]');
+          if (!b) return;
+          coin = b.dataset.coin === 'none' ? null : res[Number(b.dataset.coin)];
+          if (coin) { $('#ps-coinq').value = `${coin.name} (${coin.symbol})`; if (!$('#ps-name').value) $('#ps-name').value = coin.name; }
+          box.innerHTML = '';
+          paintManual();
+        };
+      } catch (err) { box.innerHTML = `<span class="small neg">${esc(err.message)}</span>`; }
+    };
+    $('#ps-coingo').onclick = search;
+    $('#ps-coinq').onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); search(); } };
+  }
+  focusLater(metal ? '#ps-name' : '#ps-coinq');
+  $('#ps-save').onclick = async () => {
+    const err = (m) => { $('#ps-err').textContent = m; };
+    const num = (sel) => Number(($(sel).value || '0').replace(/\s/g, '').replace(',', '.'));
+    const name = $('#ps-name').value.trim();
+    let qty = num('#ps-qty');
+    const paid = $('#ps-paid').value.trim() ? toMinor($('#ps-paid').value) : 0;
+    if (!name) return err('Wpisz nazwę.');
+    if (!Number.isFinite(qty) || qty < 0) return err('Nieprawidłowa ilość.');
+    if (!Number.isInteger(paid) || paid < 0) return err('Nieprawidłowa kwota.');
+    const item = { ...(p || { id: db.newId('pos') }), name, paid };
+    if (metal) {
+      if ($('#ps-unit').value === 'oz') qty *= TROY_OUNCE_G;
+      const spread = num('#ps-spread');
+      if (!Number.isFinite(spread) || spread < 0 || spread > 50) return err('Cena skupu: od 0 do 50%.');
+      Object.assign(item, { grams: Math.round(qty * 10000) / 10000, purity: Number($('#ps-purity').value), spread });
+    } else {
+      const manual = $('#ps-manual').value.trim() ? toMinor($('#ps-manual').value) : null;
+      if (manual != null && (!Number.isInteger(manual) || manual < 0)) return err('Nieprawidłowa wartość.');
+      Object.assign(item, { amount: qty, coin: coin?.id || null, symbol: coin?.symbol || item.symbol || '', manualValue: coin ? null : manual });
+    }
+    const positions = posId ? list.map((x) => (x.id === posId ? item : x)) : [...list, item];
+    await savePositions(a, positions);
+    closeSheet();
+    state.openPos = { ...(state.openPos || {}), [a.id]: true };
+    await reload();
+    toast('Zapisano pozycję');
+    if (!metal && coin) refreshMetalPrices({ force: true });
+  };
+  if (p) {
+    $('#ps-del').onclick = async () => {
+      await savePositions(a, list.filter((x) => x.id !== posId));
+      closeSheet();
+      await reload();
+      toast(`Usunięto: ${p.name}`, { label: 'Cofnij', run: async () => { await savePositions(accById()[a.id], [...positionsOf(accById()[a.id]), p]); await reload(); } });
+    };
+  }
+}
+
+/** Zapis pozycji; dla metali utrzymuje też sumę gramów na koncie (zgodność wstecz). */
+async function savePositions(a, positions) {
+  const upd = { ...a, positions };
+  if (metalOf(a)) upd.grams = Math.round(positions.reduce((s, p) => s + (Number(p.grams) || 0), 0) * 10000) / 10000;
+  await db.put('accounts', upd);
+}
+
+// ---------- Szybka aktualizacja (wiele operacji jednym zdaniem) ----------
+const BATCH_EXAMPLE = 'wpłynęła wypłata 9k, wpłata do ppk 300, przelewam na oszczędnościowe 300, na ikze 300, spłata kredytów według planu';
+
+function openBatchSheet(prefill = '') {
+  openSheet('⚡ Szybka aktualizacja', `
+    <p class="small muted" style="margin-top:0">Napisz albo powiedz, co się wydarzyło — kilka rzeczy naraz, oddzielone przecinkami. Np.: „${esc(BATCH_EXAMPLE)}”.</p>
+    <div class="quick"><textarea id="bt-text" rows="3" placeholder="Co się wydarzyło?">${esc(prefill)}</textarea>${speechSupported() ? '<button type="button" class="mic" id="bt-mic" aria-label="Dyktuj">🎤</button>' : ''}</div>
+    <div class="actions two" style="grid-template-columns:1fr 1fr"><button class="btn" id="bt-example">Przykład</button><button class="btn primary" id="bt-go">Rozpoznaj</button></div>
+    <div id="bt-ops"></div>`);
+  focusLater('#bt-text');
+  $('#bt-example').onclick = () => { $('#bt-text').value = BATCH_EXAMPLE; showOps(); };
+  if ($('#bt-mic')) $('#bt-mic').onclick = async () => { await dictateInto($('#bt-text')); if ($('#bt-text').value.trim()) showOps(); };
+  $('#bt-go').onclick = showOps;
+  if (prefill) showOps();
+
+  let ops = [];
+  function showOps() {
+    ops = parseBatch($('#bt-text').value, {
+      accounts: state.data.accounts, categories: state.data.categories, bills: state.data.bills, transactions: state.data.transactions,
+      month: monthKey(todayISO()), today: todayISO(), defaultAccountId: defaultAccountId(),
+    });
+    const accs = state.data.accounts.filter((a) => !a.archived && accountGroup(a) === 'current');
+    const icon = { income: '💰', expense: '🛒', transfer: '⇄', loan: '🏦', plan: '🗓️', unknown: '❓' };
+    $('#bt-ops').innerHTML = ops.length ? `<h3 class="copy-h">Do zapisania (${ops.filter((o) => o.kind !== 'unknown').length})</h3>
+      <div class="list">${ops.map((o, i) => `<div class="item bt-op ${o.kind === 'unknown' ? 'muted' : ''}">
+        ${o.kind === 'unknown' ? '<span class="ico">❓</span>' : `<input type="checkbox" data-bt="${i}" checked aria-label="Zapisz">`}
+        <span class="mid"><span class="t1">${icon[o.kind]} ${esc(o.label)}</span>
+          <span class="t2 ${o.warn ? 'neg' : ''}">${o.warn ? esc(o.warn) : o.kind === 'plan' ? 'odhaczy pozycję w planie' + (autoTxOn() ? ' i doda transakcję' : '') : o.kind === 'transfer' || o.kind === 'loan' ? 'przelew z konta: ' + esc(accById()[o.accountId]?.name || '—') : esc(catLabel(o.categoryId))}</span></span>
+        ${o.kind === 'unknown' ? '' : `<input class="copy-amt" data-bta="${i}" inputmode="decimal" value="${o.amount ? esc(minorToInput(o.amount)) : ''}" placeholder="kwota">`}
+      </div>`).join('')}</div>
+      ${accs.length > 1 ? `<label class="field"><span>Konto, z którego / na które</span><select id="bt-acc">${accs.map((a) => `<option value="${esc(a.id)}" ${a.id === defaultAccountId() ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>` : ''}
+      <div class="err" id="bt-err" role="alert"></div>
+      <div class="actions"><button class="btn primary block" id="bt-save">Zapisz zaznaczone</button></div>`
+      : '<p class="small muted">Nic nie rozpoznano.</p>';
+    const label = () => { const n = $('#sheet').querySelectorAll('[data-bt]:checked').length; const b = $('#bt-save'); if (b) { b.textContent = `Zapisz zaznaczone (${n})`; b.disabled = !n; } };
+    $('#sheet').querySelectorAll('[data-bt]').forEach((c) => { c.onchange = label; });
+    label();
+    if ($('#bt-save')) $('#bt-save').onclick = saveOps;
+  }
+
+  async function saveOps() {
+    const accId = $('#bt-acc')?.value || defaultAccountId();
+    const now = new Date().toISOString();
+    const txs = [];
+    const plans = [];
+    for (const c of $('#sheet').querySelectorAll('[data-bt]:checked')) {
+      const i = Number(c.dataset.bt);
+      const o = ops[i];
+      const amount = toMinor($(`[data-bta="${i}"]`).value);
+      if (!Number.isInteger(amount) || amount <= 0) { $('#bt-err').textContent = `${o.label}: wpisz kwotę`; return; }
+      if (o.kind === 'plan') { plans.push({ id: o.planId, amount }); continue; }
+      const t = {
+        id: db.newId('tx'), createdAt: now, updatedAt: now, currency: 'PLN', date: o.date || todayISO(), amount,
+        type: o.kind === 'loan' ? 'transfer' : o.kind, categoryId: o.categoryId || null,
+        accountId: o.kind === 'income' ? accId : accId, toAccountId: o.toAccountId || null,
+        description: o.description || '', tags: ['szybka aktualizacja'], recurring: false, refund: false,
+      };
+      if (t.type === 'transfer') t.categoryId = null;
+      const errors = validateTransaction(t, state.data);
+      if (errors.length) { $('#bt-err').textContent = `${o.label}: ${errors.join(', ')}`; return; }
+      txs.push(t);
+    }
+    if (txs.length) await db.put('transactions', ...txs);
+    for (const pl of plans) {
+      const b = state.data.bills.find((x) => x.id === pl.id);
+      if (!b) continue;
+      const item = { ...b, amount: pl.amount, paid: true, paidAt: now, accountId: b.accountId || accId };
+      item.txId = await syncPlanTx(item);
+      await db.put('bills', item);
+      await loadData();
+    }
+    closeSheet();
+    await reload();
+    toast(`Zapisano ${txs.length + plans.length} operacji`);
+  }
+}
+
 // ---------- Ustawienia ----------
 function getPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -2215,6 +2487,10 @@ function viewSettings() {
       <p id="ai-key-status" class="small muted"></p>
       ${aiKey() ? '<button class="btn danger block" data-action="ai-key-delete">Usuń klucz z telefonu</button>' : ''}
       <p class="small muted">Klucz jest tylko w tym telefonie — nie ma go na GitHubie ani w kopii zapasowej. Do Gemini trafiają wyłącznie zagregowane sumy (podgląd: Plany → AI → „Co wysyłam do AI?”).</p>
+    </section>
+    <section class="card"><h2>Ceny kryptowalut (CoinGecko)</h2>
+      <p class="small muted">Działa bez klucza. Jeśli pojawi się „limit zapytań”, załóż darmowy klucz „Demo” na coingecko.com/api i wklej go tutaj — zostaje tylko w tym telefonie.</p>
+      <div class="qa"><input id="set-cg-key" type="password" autocomplete="off" spellcheck="false" placeholder="${cgKey() ? '••••' + esc(cgKey().slice(-4)) : 'klucz (opcjonalnie)'}"><button class="btn" data-action="cg-key-save">Zapisz</button></div>
     </section>
     <section class="card"><h2>Kategorie</h2><ul class="menu">
       <li><button data-action="categories" data-kind="expense"><span>Kategorie wydatków<span class="sub">${state.data.categories.filter((c) => c.kind === 'expense' && !c.archived).length} aktywnych</span></span>›</button></li>
@@ -2819,6 +3095,10 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'pos-add': openPositionSheet(el.dataset.id); break;
+    case 'pos-edit': openPositionSheet(el.dataset.id, el.dataset.pid); break;
+    case 'batch': openBatchSheet(); break;
+    case 'cg-key-save': setPref('sf-cg-key', $('#set-cg-key').value.trim()); toast('Zapisano'); render(); break;
     case 'del-account': if ($('#sheet').open) closeSheet(); deleteAccountFlow(el.dataset.id); break;
     case 'restore-account': await restoreAccount(el.dataset.id); openTrashSheet(); break;
     case 'profile': openProfileSheet(); break;
@@ -3033,6 +3313,7 @@ async function init() {
   window.addEventListener('error', (e) => showError(e.error || e.message));
   document.addEventListener('click', onAction);
   setupLongPress();
+  document.addEventListener('toggle', (e) => { const d = e.target; if (d.matches?.('details.pos')) state.openPos = { ...state.openPos, [d.dataset.pos]: d.open }; }, true);
   document.addEventListener('change', async (e) => {
     if (e.target.id === 'set-locktime') {
       const cfg = lockCfg();
@@ -3080,10 +3361,11 @@ async function init() {
   const locked = lockEnabled() ? showLock() : Promise.resolve();
   route();
   biometricAvailable().then((v) => { state.bioAvailable = v; if (state.view === 'settings') render(); });
-  if (hasMetals() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
+  if (hasMetals() || hasCrypto() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
   await locked;
   if (shortcut === 'expense' || shortcut === 'income') openTxSheet(null, { type: shortcut });
   else if (shortcut === 'voice') openTxSheet(null, { voice: true });
+  else if (shortcut === 'batch') openBatchSheet();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline niedostępny — aplikacja działa dalej */ });
   }

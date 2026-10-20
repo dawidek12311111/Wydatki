@@ -97,3 +97,34 @@ export async function refreshPrices(prev = {}, { withHistory = false } = {}) {
   p.updatedAt = new Date().toISOString();
   return { prices: p, problems };
 }
+
+// ---------- Kryptowaluty: CoinGecko (bez klucza; opcjonalny darmowy klucz „demo” podnosi limity) ----------
+const CG = 'https://api.coingecko.com/api/v3';
+const cgHeaders = (key) => ({ Accept: 'application/json', ...(key ? { 'x-cg-demo-api-key': key } : {}) });
+
+/** Ceny w PLN dla listy identyfikatorów CoinGecko (np. bitcoin, ethereum). */
+export async function fetchCryptoPrices(ids, key = '') {
+  const list = [...new Set(ids.filter(Boolean))];
+  if (!list.length) return {};
+  let res;
+  try {
+    res = await fetch(`${CG}/simple/price?ids=${encodeURIComponent(list.join(','))}&vs_currencies=pln`, { headers: cgHeaders(key), credentials: 'omit', referrerPolicy: 'no-referrer', cache: 'no-store' });
+  } catch { throw new Error('brak połączenia z CoinGecko'); }
+  if (res.status === 429) throw new Error('limit zapytań CoinGecko — spróbuj za minutę');
+  if (!res.ok) throw new Error(`CoinGecko: błąd ${res.status}`);
+  const j = await res.json();
+  const at = new Date().toISOString();
+  const out = {};
+  for (const id of list) if (j?.[id]?.pln > 0) out[id] = { pln: j[id].pln, at };
+  return out;
+}
+
+/** Wyszukiwanie kryptowaluty po nazwie lub symbolu. */
+export async function searchCoins(query, key = '') {
+  const q = String(query || '').trim();
+  if (!q) return [];
+  const res = await fetch(`${CG}/search?query=${encodeURIComponent(q)}`, { headers: cgHeaders(key), credentials: 'omit', referrerPolicy: 'no-referrer' });
+  if (!res.ok) throw new Error(`CoinGecko: błąd ${res.status}`);
+  const j = await res.json();
+  return (j.coins || []).slice(0, 12).map((c) => ({ id: c.id, symbol: (c.symbol || '').toUpperCase(), name: c.name }));
+}
