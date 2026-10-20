@@ -22,11 +22,12 @@ import { parseBatch } from './batch.js';
 import { termDeposit, savingsEstimate, isTermDeposit, depositsDue, addMonthsDate } from './deposit.js';
 import { netWorthHistory, historyStats, breakdown } from './history.js';
 import { playFilm } from './film.js';
+import { financialPulse, cushion, liquidSavings, detectSubscriptions, envelopeStatus, monthForecast, dailyAllowance, taxReport, levelOf, equivalents, streak, BADGES, earnedBadges, plusMonthsBest, smartSuggestions, yearSummary } from './fun.js';
 import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '1.0.1';
+export const APP_VERSION = '1.1.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -36,6 +37,12 @@ const state = {
   data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
   plansTab: 'buy',
   prices: null,
+  badges: {},
+  capsules: [],
+  envelopes: [],
+  noSpendDays: [],
+  whatIf: null,
+  taxYear: null,
   snapshots: {},
   nwRange: '12',
   nwLayers: false,
@@ -63,6 +70,7 @@ const VIEWS = {
   budget: { title: 'Plan', month: true },
   wealth: { title: 'Majątek', month: true },
   plans: { title: 'Plany', month: true },
+  fun: { title: 'Osiągnięcia', month: false },
   settings: { title: 'Ustawienia', month: false },
 };
 
@@ -132,6 +140,8 @@ function txRow(t, cats = catById(), accs = accById()) {
 }
 
 function toast(msg, action) {
+  labelUndo(msg);
+  lastToastAt = Date.now();
   const el = $('#toast');
   el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button>${esc(action.label)}</button>` : ''}`;
   el.hidden = false;
@@ -162,6 +172,8 @@ async function loadData() {
 async function reload() {
   await loadData();
   render();
+  clearTimeout(reload.t);
+  reload.t = setTimeout(() => checkBadges().catch(() => {}), 400);
 }
 
 // ---------- nawigacja ----------
@@ -183,10 +195,10 @@ function render() {
   });
   const html = {
     dashboard: viewDashboard, transactions: viewTransactions, budget: viewBudget,
-    wealth: viewWealth, plans: viewPlans, settings: viewSettings,
+    wealth: viewWealth, plans: viewPlans, settings: viewSettings, fun: viewFun,
   }[state.view]();
   $('#view').innerHTML = html;
-  if (state.view === 'plans' && state.plansTab === 'sim') bindSimForm();
+  if (state.view === 'plans' && state.plansTab === 'sim') { bindSimForm(); bindWhatIf(); }
   if (state.view === 'transactions') {
     const s = $('#tx-search');
     if (s) s.oninput = () => { state.txSearch = s.value; renderTxList(); };
@@ -200,8 +212,11 @@ function viewDashboard() {
   const s = monthSummary(txs, state.month);
   const parts = [];
   const lp = (id) => `data-lp="card:${id}"`;
+  parts.push(capsuleNotice());
   parts.push(depositReminders());
+  parts.push(eveningReminder());
   if (state.profile?.name) parts.push(`<button class="hello link" data-action="profile" style="color:inherit"><span class="av">${profileAvatar()}</span>Cześć, ${esc(state.profile.name)} 👋</button>`);
+  if (state.data.transactions.length) parts.push(achievementsStrip());
 
   if (!state.data.transactions.length) {
     parts.push(`<div class="note">👋 Witaj! Zacznij od <b>Majątek</b> → wpisz aktualne salda swoich kont, a potem dodawaj wydatki przyciskiem <b>+</b>.<br>Przytrzymaj dowolny kafelek, żeby zobaczyć więcej opcji.</div>`);
@@ -215,6 +230,7 @@ function viewDashboard() {
         <div><small>Przychody</small><b class="num">${esc(formatMoney(s.income))}</b></div>
         <div><small>Wydatki</small><b class="num">${esc(formatMoney(s.expense))}</b></div>
       </div>
+      ${s.net > 0 ? `<div class="foot">${equivalents(s.net, Number(state.month.slice(5, 7)), 1).map((e) => `To równowartość ${esc(String(e.count).replace('.', ','))} ${e.icon} ${esc(e.label)}`).join('')}</div>` : ''}
       <div class="foot">Odłożone z dochodu: <b>${pct(s.savingsRate)}</b>${s.transfersOut ? ` · transfery: <span class="num">${esc(formatMoney(s.transfersOut))}</span> (nie liczone jako wydatki)` : ''}</div>
     </section>`,
 
@@ -252,6 +268,10 @@ function viewDashboard() {
     },
 
     metals: () => metalPricesCard(true),
+    pulse: () => pulseCard(lp('pulse')),
+    allowance: () => allowanceCard(lp('allowance')),
+    piggy: () => piggyCard(lp('piggy')),
+    envelopes: () => envelopesCard(lp('envelopes')),
     nwchart: () => nwChartCard({ lpAttr: lp('nwchart') }),
 
     purchases: () => {
@@ -440,7 +460,7 @@ async function fixMissingPlanTx() {
     const item = { ...b, txId: null };
     item.txId = await syncPlanTx(item);
     if (item.txId) n++;
-    await db.put('bills', item);
+    await dbPut('bills', item);
     await loadData(); // świeże dane dla kolejnej pozycji
   }
   await reload();
@@ -458,7 +478,7 @@ async function syncPlanTx(item) {
     if (linked) {
       const upd = { ...linked, type: kind, amount: item.amount, description: item.name, categoryId, updatedAt: new Date().toISOString() };
       if (item.accountId) upd.accountId = item.accountId;
-      if (!validateTransaction(upd, state.data).length) await db.put('transactions', upd);
+      if (!validateTransaction(upd, state.data).length) await dbPut('transactions', upd);
       return linked.id;
     }
     if (!autoTxOn()) return null;
@@ -474,10 +494,10 @@ async function syncPlanTx(item) {
     };
     const errors = validateTransaction(t, state.data);
     if (errors.length) { toast('Nie dodano transakcji: ' + errors.join(', ')); return null; }
-    await db.put('transactions', t);
+    await dbPut('transactions', t);
     return t.id;
   }
-  if (linked) await db.put('transactions', { ...linked, deletedAt: new Date().toISOString() });
+  if (linked) await dbPut('transactions', { ...linked, deletedAt: new Date().toISOString() });
   return null;
 }
 
@@ -572,7 +592,7 @@ function openBillSheet(id, kindArg) {
     const errors = validateBill(item);
     if (errors.length) { $('#bl-err').textContent = errors.join(' · '); return; }
     item.txId = await syncPlanTx(item);
-    await db.put('bills', item);
+    await dbPut('bills', item);
     closeSheet();
     await reload();
     toast(b ? 'Zapisano' : 'Dodano do planu');
@@ -586,9 +606,11 @@ async function toggleBill(id) {
   const item = { ...b, paid: !b.paid, paidAt: !b.paid ? new Date().toISOString() : null };
   const hadTx = b.txId && state.data.transactions.some((t) => t.id === b.txId && !t.deletedAt);
   item.txId = await syncPlanTx(item);
-  await db.put('bills', item);
+  await dbPut('bills', item);
   await reload();
   if (item.paid && item.txId && !hadTx) toast(`Dodano ${kindOf(item) === 'income' ? 'przychód' : 'wydatek'}: ${formatMoney(item.amount)}`);
+  const ps = planSummary(state.data.bills, item.month);
+  if (item.paid && ps.expense.count > 1 && ps.expense.left === 0 && kindOf(item) === 'expense') celebrate('✅ Wszystkie opłaty w tym miesiącu zapłacone!');
   else if (!item.paid && hadTx) toast('Usunięto też powiązaną transakcję (jest w koszu)');
 }
 
@@ -625,7 +647,7 @@ function openCopySheet() {
       if (errors.length) { $('#cp-err').textContent = `${items[i].name}: ${errors.join(', ')}`; return; }
       out.push(item);
     }
-    await db.put('bills', ...out);
+    await dbPut('bills', ...out);
     closeSheet();
     await reload();
     toast(`Skopiowano ${out.length} pozycji`);
@@ -919,7 +941,7 @@ function openAccountSheet(id, group) {
     }
     item.openingBalance = opening;
     item.image = pick.get() || null;
-    await db.put('accounts', item);
+    await dbPut('accounts', item);
     closeSheet();
     await reload();
     toast('Zapisano');
@@ -1031,7 +1053,7 @@ async function openMoveSheet(id, mode) {
     }
     let pid = $('#mv-pos')?.value || null;
     if (pid === '__new' && !$('#mv-newname').value.trim()) { $('#mv-err').textContent = 'Wpisz nazwę nowej pozycji.'; return; }
-    await db.put('transactions', t);
+    await dbPut('transactions', t);
     if (posList.length && (grams || qty)) {
       let list = positionsOf(a);
       if (pid === '__new') {
@@ -1043,9 +1065,10 @@ async function openMoveSheet(id, mode) {
       await savePositions(a, list);
     } else if (metal && grams) {
       const g = Math.max(0, Math.round(((Number(a.grams) || 0) + (mode === 'out' ? -grams : grams)) * 10000) / 10000);
-      await db.put('accounts', { ...a, grams: g });
+      await dbPut('accounts', { ...a, grams: g });
     }
     if (other) await db.setSetting('lastMoveAccount', other);
+    if (mode === 'in' && accountGroup(a) === 'savings') playCoin();
     closeSheet();
     if (monthKey(t.date) !== state.month) state.month = monthKey(t.date);
     await reload();
@@ -1201,7 +1224,7 @@ const ai = { history: [], busy: false, error: '' };
 function viewPlans() {
   const tab = state.plansTab || 'buy';
   const t = (id, label) => `<button type="button" data-action="plans-tab" data-tab2="${id}" aria-pressed="${tab === id}">${label}</button>`;
-  const body = tab === 'analysis' ? viewAnalytics() : tab === 'ai' ? viewAI() : tab === 'sim' ? viewSim() : viewPurchases();
+  const body = tab === 'analysis' ? analysisExtrasHtml() + viewAnalytics() : tab === 'ai' ? viewAI() : tab === 'sim' ? viewSim() : viewPurchases();
   return `<div class="seg plans-seg">${t('buy', '🛒 Zakupy')}${t('sim', '🔮 Symulacja')}${t('analysis', '📊 Analiza')}${t('ai', '✨ AI')}</div>${body}`;
 }
 
@@ -1394,7 +1417,7 @@ function openPurchaseSheet(id) {
     const errors = validatePurchase(item);
     if (item.loanRate != null && !item.loanMonths) errors.push('Podaj okres kredytu w miesiącach');
     if (errors.length) { $('#pu-err').textContent = errors.join(' · '); return; }
-    await db.put('purchases', item);
+    await dbPut('purchases', item);
     closeSheet();
     await reload();
     toast('Zapisano');
@@ -1405,16 +1428,16 @@ function openPurchaseSheet(id) {
 async function deletePurchase(id) {
   const p = state.data.purchases.find((x) => x.id === id);
   if (!p) return;
-  await db.remove('purchases', id);
+  await dbRemove('purchases', id);
   await reload();
-  toast(`Usunięto: ${p.name}`, { label: 'Cofnij', run: async () => { await db.put('purchases', p); await reload(); } });
+  toast(`Usunięto: ${p.name}`, { label: 'Cofnij', run: async () => { await dbPut('purchases', p); await reload(); } });
 }
 
 async function togglePurchaseBought(id) {
   const p = state.data.purchases.find((x) => x.id === id);
   if (!p) return;
   const bought = p.status !== 'bought';
-  await db.put('purchases', { ...p, status: bought ? 'bought' : 'saving', boughtAt: bought ? new Date().toISOString() : null });
+  await dbPut('purchases', { ...p, status: bought ? 'bought' : 'saving', boughtAt: bought ? new Date().toISOString() : null });
   await reload();
   toast(bought ? `Kupione: ${p.name} 🎉 — dodaj wydatek przyciskiem +, jeśli chcesz go mieć w transakcjach` : 'Przywrócono do planów');
 }
@@ -1840,14 +1863,14 @@ async function deleteAccountFlow(id) {
   if (!ok) return;
   const now = new Date().toISOString();
   const txIds = new Set(txs.map((t) => t.id));
-  await db.put('accounts', { ...a, deletedAt: now });
-  if (txs.length) await db.put('transactions', ...txs.map((t) => ({ ...t, deletedAt: now, deletedWithAccount: id })));
+  await dbPut('accounts', { ...a, deletedAt: now });
+  if (txs.length) await dbPut('transactions', ...txs.map((t) => ({ ...t, deletedAt: now, deletedWithAccount: id })));
   const bills = state.data.bills.filter((b) => b.accountId === id || (b.txId && txIds.has(b.txId)));
-  if (bills.length) await db.put('bills', ...bills.map((b) => ({ ...b, accountId: b.accountId === id ? null : b.accountId, ...(b.txId && txIds.has(b.txId) ? { txId: null, txSkipped: true } : {}) })));
+  if (bills.length) await dbPut('bills', ...bills.map((b) => ({ ...b, accountId: b.accountId === id ? null : b.accountId, ...(b.txId && txIds.has(b.txId) ? { txId: null, txSkipped: true } : {}) })));
   const buys = state.data.purchases.filter((p) => p.accountId === id);
-  if (buys.length) await db.put('purchases', ...buys.map((p) => ({ ...p, accountId: null, savedManual: Math.max(0, value) })));
+  if (buys.length) await dbPut('purchases', ...buys.map((p) => ({ ...p, accountId: null, savedManual: Math.max(0, value) })));
   const linked = state.data.accounts.filter((x) => x.loanId === id);
-  if (linked.length) await db.put('accounts', ...linked.map((x) => ({ ...x, loanId: null })));
+  if (linked.length) await dbPut('accounts', ...linked.map((x) => ({ ...x, loanId: null })));
   if (state.prefs.defaultAccount === id) { state.prefs.defaultAccount = ''; await db.setSetting('defaultAccount', ''); }
   await reload();
   toast(`Usunięto: ${a.name}`, { label: 'Cofnij', run: () => restoreAccount(id) });
@@ -1858,9 +1881,9 @@ async function restoreAccount(id) {
   const a = all.find((x) => x.id === id);
   if (!a) return;
   const { deletedAt, ...live } = a;
-  await db.put('accounts', live);
+  await dbPut('accounts', live);
   const txs = state.data.transactions.filter((t) => t.deletedWithAccount === id);
-  if (txs.length) await db.put('transactions', ...txs.map(({ deletedAt: d, deletedWithAccount, ...t }) => t));
+  if (txs.length) await dbPut('transactions', ...txs.map(({ deletedAt: d, deletedWithAccount, ...t }) => t));
   await reload();
   toast(`Przywrócono: ${a.name}`);
 }
@@ -2011,7 +2034,7 @@ function openValuationSheet(id) {
     if (!date || date > today) { $('#va-err').textContent = 'Wybierz datę nie późniejszą niż dziś.'; return; }
     const valuations = sortedValuations(a).filter((v) => v.date !== date);
     valuations.push({ date, value: r.value, book: bookBalance(a, txs, date), at: new Date().toISOString() });
-    await db.put('accounts', { ...a, valuations });
+    await dbPut('accounts', { ...a, valuations });
     closeSheet();
     await reload();
     toast(`Zapisano wycenę: ${formatMoney(r.value, a.currency)}`);
@@ -2127,7 +2150,8 @@ function viewSim() {
       </details>
       <button class="btn block" data-action="sim-reset" style="margin-top:10px">Przywróć domyślne założenia</button>
     </section>
-    <div id="sim-results">${simResultsHtml(s, st)}</div>`;
+    <div id="sim-results">${simResultsHtml(s, st)}</div>
+    ${whatIfHtml()}`;
 }
 
 function simResultsHtml(s = simSettings(), st = simStart()) {
@@ -2367,7 +2391,7 @@ function openPositionSheet(accId, posId = null) {
 async function savePositions(a, positions) {
   const upd = { ...a, positions };
   if (metalOf(a)) upd.grams = Math.round(positions.reduce((s, p) => s + (Number(p.grams) || 0), 0) * 10000) / 10000;
-  await db.put('accounts', upd);
+  await dbPut('accounts', upd);
 }
 
 // ---------- Szybka aktualizacja (wiele operacji jednym zdaniem) ----------
@@ -2432,13 +2456,13 @@ function openBatchSheet(prefill = '') {
       if (errors.length) { $('#bt-err').textContent = `${o.label}: ${errors.join(', ')}`; return; }
       txs.push(t);
     }
-    if (txs.length) await db.put('transactions', ...txs);
+    if (txs.length) await dbPut('transactions', ...txs);
     for (const pl of plans) {
       const b = state.data.bills.find((x) => x.id === pl.id);
       if (!b) continue;
       const item = { ...b, amount: pl.amount, paid: true, paidAt: now, accountId: b.accountId || accId };
       item.txId = await syncPlanTx(item);
-      await db.put('bills', item);
+      await dbPut('bills', item);
       await loadData();
     }
     closeSheet();
@@ -2469,7 +2493,7 @@ async function moveToProperty(id) {
     { confirmLabel: 'Przenieś' });
   if (!ok) return;
   const { depositKind, rate, termMonths, startDate, promoRate, promoLimit, promoMonths, positions, grams, purity, spread, ...rest } = a;
-  await db.put('accounts', { ...rest, type: 'property', subtype: kind, growth: PROPERTY_KINDS[kind].growth });
+  await dbPut('accounts', { ...rest, type: 'property', subtype: kind, growth: PROPERTY_KINDS[kind].growth });
   await reload();
   toast('Przeniesiono do Nieruchomości');
 }
@@ -2584,7 +2608,7 @@ async function bookDepositInterest(a) {
   const r = termDeposit({ principal: bookB, rate: a.rate, months: a.termMonths, startDate: a.startDate, today: todayISO() });
   const now = new Date().toISOString();
   if (r.net > 0) {
-    await db.put('transactions', { id: db.newId('tx'), createdAt: now, updatedAt: now, type: 'income', amount: r.net, currency: a.currency, date: r.ended ? r.end : todayISO(),
+    await dbPut('transactions', { id: db.newId('tx'), createdAt: now, updatedAt: now, type: 'income', amount: r.net, currency: a.currency, date: r.ended ? r.end : todayISO(),
       categoryId: 'inc-other', accountId: a.id, toAccountId: null, description: `Odsetki: ${a.name}`, tags: ['odsetki'], recurring: false, refund: false });
   }
   return r;
@@ -2611,11 +2635,11 @@ async function depositAction(kind, id) {
   if (!ok) return;
   await bookDepositInterest(a);
   if (kind === 'renew') {
-    await db.put('accounts', { ...a, startDate: r.ended ? r.end : todayISO() });
+    await dbPut('accounts', { ...a, startDate: r.ended ? r.end : todayISO() });
     await reload();
     toast('Lokata odnowiona');
   } else {
-    await db.put('accounts', { ...a, depositKind: 'term', rate: a.rate, startDate: a.startDate });
+    await dbPut('accounts', { ...a, depositKind: 'term', rate: a.rate, startDate: a.startDate });
     await reload();
     await openMoveSheet(a.id, 'out');
     $('#mv-amount').value = minorToInput(balances(state.data.accounts, liveTx())[a.id]);
@@ -2715,6 +2739,510 @@ function openFilm() {
   playFilm(root, filmData(), { voice: getPref('sf-film-voice', '0') === '1', onClose: () => {} });
 }
 
+// ---------- v1.1: cofanie zmian ----------
+const undoLog = []; // [{ label, at, changes: [{ store, id, before }] }]
+let undoGroup = null;
+let undoTimer = null;
+
+async function trackBefore(store, id) {
+  if (store === 'settings') return;
+  if (!undoGroup) {
+    undoGroup = { label: 'Zmiana', at: new Date().toISOString(), changes: [] };
+    undoLog.unshift(undoGroup);
+    if (undoLog.length > 20) undoLog.pop();
+  }
+  if (undoGroup.changes.some((c) => c.store === store && c.id === id)) return;
+  const before = await db.get(store, id);
+  undoGroup.changes.push({ store, id, before: before ? structuredClone(before) : null });
+  clearTimeout(undoTimer);
+  undoTimer = setTimeout(() => { undoGroup = null; }, 1500);
+}
+async function dbPut(store, ...items) {
+  for (const it of items) await trackBefore(store, it.id);
+  return db.put(store, ...items);
+}
+async function dbRemove(store, id) {
+  await trackBefore(store, id);
+  return db.remove(store, id);
+}
+function labelUndo(text) {
+  if (undoLog[0] && Date.now() - new Date(undoLog[0].at).getTime() < 4000 && undoLog[0].label === 'Zmiana') undoLog[0].label = text;
+}
+async function undoAt(i) {
+  const g = undoLog[i];
+  if (!g) return;
+  undoGroup = null;
+  for (const c of [...g.changes].reverse()) {
+    if (c.before) await db.put(c.store, c.before); else await db.remove(c.store, c.id);
+  }
+  undoLog.splice(0, i + 1); // cofamy też wszystko, co było po niej
+  await reload();
+  toast(`Cofnięto: ${g.label}`);
+}
+function openUndoSheet() {
+  openSheet('Historia zmian', undoLog.length ? `<p class="small muted" style="margin-top:0">Ostatnie zmiany z tej sesji. Cofnięcie zmiany cofa też wszystkie nowsze.</p>
+    <ul class="menu">${undoLog.map((g, i) => `<li><button data-action="undo-at" data-i="${i}"><span>${esc(g.label)}<span class="sub">${esc(g.at.slice(11, 16))} · ${g.changes.length} ${g.changes.length === 1 ? 'zapis' : 'zapisy'}</span></span><span class="link">Cofnij</span></button></li>`).join('')}</ul>`
+    : '<p class="empty">Brak zmian do cofnięcia w tej sesji.</p>');
+}
+
+// ---------- Dźwięki i konfetti ----------
+const soundsOn = () => getPref('sf-sounds', '1') === '1';
+let audioCtx = null;
+function beep(notes) {
+  if (!soundsOn()) return;
+  try {
+    audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+    const t0 = audioCtx.currentTime;
+    for (const [f, at, dur, vol = 0.12, type = 'sine'] of notes) {
+      const o = audioCtx.createOscillator(); const g = audioCtx.createGain();
+      o.type = type; o.frequency.value = f;
+      g.gain.setValueAtTime(0, t0 + at); g.gain.linearRampToValueAtTime(vol, t0 + at + 0.01); g.gain.exponentialRampToValueAtTime(0.0001, t0 + at + dur);
+      o.connect(g); g.connect(audioCtx.destination); o.start(t0 + at); o.stop(t0 + at + dur + 0.05);
+    }
+  } catch { /* brak dźwięku */ }
+}
+const playCoin = () => beep([[1318, 0, 0.12, 0.1, 'square'], [1760, 0.07, 0.35, 0.09, 'square']]);
+const playFanfare = () => beep([[523, 0, 0.18], [659, 0.12, 0.18], [784, 0.24, 0.18], [1046, 0.36, 0.6, 0.15]]);
+
+function confetti(ms = 1800) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const c = document.createElement('canvas');
+  c.className = 'confetti';
+  document.body.appendChild(c);
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  c.width = innerWidth * dpr; c.height = innerHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr);
+  const colors = ['#ffd54a', '#4cc98a', '#6b9cff', '#f27aae', '#fb923c', '#a98bfa'];
+  const parts = Array.from({ length: 140 }, () => ({ x: innerWidth / 2 + (Math.random() - 0.5) * 80, y: innerHeight * 0.35, vx: (Math.random() - 0.5) * 11, vy: -Math.random() * 12 - 4,
+    s: 5 + Math.random() * 6, r: Math.random() * 6, vr: (Math.random() - 0.5) * 0.4, c: colors[(Math.random() * colors.length) | 0] }));
+  const start = performance.now();
+  const step = (now) => {
+    const t = now - start;
+    g.clearRect(0, 0, innerWidth, innerHeight);
+    for (const p of parts) {
+      p.vy += 0.32; p.x += p.vx; p.y += p.vy; p.r += p.vr; p.vx *= 0.99;
+      g.save(); g.translate(p.x, p.y); g.rotate(p.r); g.globalAlpha = Math.max(0, 1 - t / ms); g.fillStyle = p.c; g.fillRect(-p.s / 2, -p.s / 4, p.s, p.s / 2); g.restore();
+    }
+    if (t < ms) requestAnimationFrame(step); else c.remove();
+  };
+  requestAnimationFrame(step);
+}
+let lastToastAt = 0;
+function celebrate(text) {
+  const wait = Math.max(0, 2600 - (Date.now() - lastToastAt)); // nie zasłaniaj świeżego komunikatu (np. „Zapisano…”)
+  setTimeout(() => { confetti(); playFanfare(); if (text) toast(text); }, wait);
+}
+
+// ---------- Wskaźniki (puls, poduszka, poziom, seria) ----------
+function metrics() {
+  const txs = liveTx();
+  const now = monthKey(todayISO());
+  const w = valuedNetWorth(state.data.accounts, txs, valOpts());
+  const avg = averages(txs, addMonths(now, -1), 3);
+  const avgExpense = avg.months ? avg.expense : monthSummary(txs, now).expense;
+  const liquid = liquidSavings(state.data.accounts, w.values);
+  const cu = cushion({ liquid, avgExpense, goalMonths: Number(getPref('sf-cushion-goal', '6')) });
+  const consumerDebt = state.data.accounts.filter((a) => a.type === 'loan' && !a.archived && !/hipote|mieszkan|dom/i.test(a.name)).reduce((s, a) => s + Math.max(0, -(w.values[a.id] || 0)), 0)
+    + state.data.accounts.filter((a) => a.type === 'card').reduce((s, a) => s + Math.max(0, -(w.values[a.id] || 0)), 0);
+  const ps = planSummary(state.data.bills, now);
+  const planCount = ps.income.count + ps.expense.count;
+  const hist = nwSeries();
+  const st = historyStats(hist);
+  const pulse = financialPulse({
+    savingsRate: avg.months && avg.income > 0 ? avg.net / avg.income : monthSummary(txs, now).savingsRate,
+    cushionMonths: cu.months, consumerDebt, avgIncome: avg.income, planDone: planCount ? (ps.income.doneCount + ps.expense.doneCount) / planCount : null, trend: st?.m1 ?? null,
+  });
+  const noSpend = state.noSpendDays || [];
+  return { w, avg, avgExpense, liquid, cu, pulse, st, level: levelOf(w.net), streak: streak(txs, noSpend, todayISO()) };
+}
+
+// ---------- Karty na Start ----------
+function pulseCard(lpAttr) {
+  const m = metrics();
+  const p = m.pulse;
+  const color = p.score >= 70 ? 'var(--income)' : p.score >= 40 ? 'var(--warn)' : 'var(--expense)';
+  const deg = Math.round((p.score / 100) * 360);
+  return `<section class="card" ${lpAttr}><h2>Puls finansowy <button class="link" data-action="pulse-info">Szczegóły ›</button></h2>
+    <div class="pulse"><div class="pulse-ring" style="background:conic-gradient(${color} ${deg}deg, var(--surface-2) 0)"><div><b>${p.score}</b><small>${esc(p.label)}</small></div></div>
+      <div class="pulse-tip">${p.tips[0] ? `💡 ${esc(p.tips[0])}` : '🎉 Wszystko gra — tak trzymaj!'}
+        <div class="small muted" style="margin-top:6px">🛟 Poduszka: <b>${m.cu.months == null ? '—' : esc(dec1(m.cu.months))} mies.</b> z ${esc(getPref('sf-cushion-goal', '6'))}</div></div></div>
+  </section>`;
+}
+
+function openPulseSheet() {
+  const m = metrics();
+  openSheet('Puls finansowy', `<div class="pulse" style="margin-bottom:8px"><div class="pulse-ring" style="background:conic-gradient(var(--accent) ${Math.round(m.pulse.score * 3.6)}deg, var(--surface-2) 0)"><div><b>${m.pulse.score}</b><small>${esc(m.pulse.label)}</small></div></div>
+    <div class="small muted">Ocena 0–100 z pięciu obszarów. Najwięcej punktów zyskasz, poprawiając pierwszą poradę.</div></div>
+    <ul class="bars">${m.pulse.parts.map((x) => `<li><div class="row"><span>${esc(x.label)}</span><span class="num">${x.score} / ${x.max}</span></div><div class="track"><div class="fill" style="width:${(x.score / x.max) * 100}%"></div></div>${x.tip ? `<div class="small muted">${esc(x.tip)}</div>` : ''}</li>`).join('')}</ul>
+    <h3 class="copy-h">🛟 Poduszka bezpieczeństwa</h3>
+    <ul class="menu kv"><li><div><span>Pieniądze pod ręką</span><span class="num"><b>${esc(formatMoney(m.liquid))}</b></span></div></li>
+      <li><div><span>Średnie wydatki / mies.</span><span class="num">${esc(formatMoney(m.avgExpense))}</span></div></li>
+      <li><div><span>Wystarczy na</span><span><b>${m.cu.months == null ? '—' : esc(dec1(m.cu.months))} mies.</b></span></div></li>
+      <li><div><span>Cel: ${esc(getPref('sf-cushion-goal', '6'))} mies.</span><span class="num">${m.cu.missing ? `brakuje ${esc(formatMoney(m.cu.missing))}` : '<span class="pos">osiągnięty ✓</span>'}</span></div></li></ul>
+    <div class="track"><div class="fill" style="width:${(m.cu.progress * 100).toFixed(1)}%"></div></div>
+    <p class="small muted">„Pod ręką” = konta bieżące, oszczędnościowe i lokaty (bez IKE/IKZE/PPK, metali, krypto i nieruchomości). Cel zmienisz w Ustawieniach.</p>`);
+}
+
+function allowanceCard(lpAttr) {
+  const ym = monthKey(todayISO());
+  const avgInc = averages(liveTx(), addMonths(ym, -1), 3).income;
+  const d = dailyAllowance({ transactions: state.data.transactions, bills: state.data.bills, ym, today: todayISO(), savingGoal: Math.round(Number(getPref('sf-save-goal', '0')) * 100), fallbackIncome: avgInc });
+  const f = monthForecast({ transactions: state.data.transactions, bills: state.data.bills, ym, today: todayISO() });
+  const ok = d.todayLeft >= 0;
+  return `<section class="card" ${lpAttr}><h2>Ile mogę dziś wydać</h2>
+    <div class="allow"><b class="num ${d.perDay < 0 ? 'neg' : ''}">${esc(formatMoney(Math.max(0, d.todayLeft)))}</b>
+      <span class="small muted">${d.estimated ? '<b>wg średniego dochodu</b> (brak wypłaty w tym miesiącu) · ' : ''}${d.perDay > 0 ? `${ok ? 'zostało na dziś' : 'dziś już ponad limit o ' + esc(formatMoney(-d.todayLeft))} · limit ${esc(formatMoney(d.perDay))}/dzień przez ${d.daysLeft} dni` : 'brak wolnych środków w tym miesiącu wg planu'}</span></div>
+    <p class="small" style="margin:8px 0 0">🔮 Prognoza na koniec miesiąca: <b class="num ${f.net >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(f.net, 'PLN', { sign: true }))}</b>
+      <span class="muted">(tempo ${esc(formatMoney(f.perDay))}/dzień${f.unpaid ? `, do zapłaty ${esc(formatMoney(f.unpaid))}` : ''})</span></p>
+    ${f.net < 0 ? '<p class="small neg" style="margin:4px 0 0">⚠ Przy obecnym tempie skończysz miesiąc na minusie.</p>' : ''}
+  </section>`;
+}
+
+function piggyCard(lpAttr) {
+  const m = metrics();
+  const fill = Math.round(m.cu.progress * 100);
+  const y = 92 - fill * 0.62;
+  return `<section class="card piggy-card" ${lpAttr}><h2>Skarbonka <span class="small muted">${fill}% poduszki</span></h2>
+    <div class="piggy-row"><svg class="piggy" viewBox="0 0 120 100" aria-hidden="true">
+      <defs><clipPath id="pigclip"><path d="M20 55c0-22 20-35 42-35s40 12 40 32c0 8-3 15-8 20l2 14h-12l-3-8c-6 2-12 3-19 3s-14-1-20-4l-3 9H27l3-15c-6-5-10-10-10-16z"/></clipPath></defs>
+      <path class="pig-body" d="M20 55c0-22 20-35 42-35s40 12 40 32c0 8-3 15-8 20l2 14h-12l-3-8c-6 2-12 3-19 3s-14-1-20-4l-3 9H27l3-15c-6-5-10-10-10-16z"/>
+      <rect clip-path="url(#pigclip)" class="pig-fill" x="0" y="${y}" width="120" height="100"/>
+      <path class="pig-line" d="M20 55c0-22 20-35 42-35s40 12 40 32c0 8-3 15-8 20l2 14h-12l-3-8c-6 2-12 3-19 3s-14-1-20-4l-3 9H27l3-15c-6-5-10-10-10-16z"/>
+      <circle cx="84" cy="42" r="3" class="pig-eye"/><rect x="50" y="18" width="18" height="5" rx="2" class="pig-slot"/>
+      <ellipse cx="104" cy="52" rx="6" ry="8" class="pig-body pig-line"/>
+    </svg>
+    <div><b class="num">${esc(formatMoney(m.liquid))}</b><div class="small muted">${m.cu.missing ? `do celu brakuje ${esc(formatMoney(m.cu.missing))}` : 'Poduszka pełna! 🎉'}</div>
+    ${m.st?.m1 > 0 ? `<div class="small" style="margin-top:6px">${equivalents(m.st.m1, Number(todayISO().slice(5, 7)), 1).map((e) => `W tym miesiącu przybyło równowartość <b>${esc(String(e.count).replace('.', ','))}</b> ${e.icon} ${esc(e.label)}`).join('')}</div>` : ''}</div></div>
+  </section>`;
+}
+
+function envelopesCard(lpAttr) {
+  const list = envelopeStatus(state.envelopes || [], state.data.transactions, state.data.categories, state.month);
+  return `<section class="card" ${lpAttr}><h2>Koperty <button class="link" data-action="envelopes">Ustaw ›</button></h2>
+    ${list.length ? `<ul class="bars">${list.map((e) => `<li><div class="row"><span>${esc(e.icon || '✉️')} ${esc(e.name)}</span><span class="num ${e.left < 0 ? 'neg' : ''}">${e.left >= 0 ? 'zostało ' + esc(formatMoney(e.left)) : 'ponad o ' + esc(formatMoney(-e.left))}</span></div>
+      <div class="track"><div class="fill ${e.ratio > 1 ? 'over' : e.ratio > 0.8 ? 'near' : ''}" style="width:${Math.min(100, e.ratio * 100).toFixed(1)}%"></div></div>
+      <div class="small muted"><span class="num">${esc(formatMoney(e.spent))}</span> z <span class="num">${esc(formatMoney(e.limit))}</span></div></li>`).join('')}</ul>`
+      : '<p class="small muted">Podziel wypłatę na koperty (np. jedzenie, paliwo, przyjemności) i pilnuj, ile zostało. <button class="link" data-action="envelopes">Utwórz koperty</button></p>'}
+  </section>`;
+}
+
+const ENVELOPE_PRESETS = [
+  { name: 'Jedzenie', icon: '🛒', categoryIds: ['exp-food'] },
+  { name: 'Auto i paliwo', icon: '⛽', categoryIds: ['exp-transport'] },
+  { name: 'Przyjemności', icon: '🎉', categoryIds: ['exp-fun', 'exp-travel'] },
+  { name: 'Zakupy', icon: '🛍️', categoryIds: ['exp-shopping'] },
+  { name: 'Dzieci', icon: '🧸', categoryIds: ['exp-kids'] },
+  { name: 'Zdrowie', icon: '💊', categoryIds: ['exp-health'] },
+];
+
+function openEnvelopesSheet() {
+  let list = (state.envelopes || []).map((e) => ({ ...e }));
+  if (!list.length) list = ENVELOPE_PRESETS.slice(0, 3).map((e, i) => ({ ...e, id: 'env' + i, limit: 0 }));
+  const cats = state.data.categories.filter((c) => c.kind === 'expense' && !c.parentId && !c.archived);
+  const paint = () => {
+    $('#env-list').innerHTML = list.map((e, i) => `<div class="env-row">
+      <div class="grid2" style="grid-template-columns:56px 1fr 110px;align-items:end">
+        <label class="field"><span>Ikona</span><input data-env="icon" data-i="${i}" maxlength="4" value="${esc(e.icon || '')}" style="text-align:center"></label>
+        <label class="field"><span>Koperta</span><input data-env="name" data-i="${i}" maxlength="30" value="${esc(e.name)}"></label>
+        <label class="field"><span>Limit / mies.</span><input data-env="limit" data-i="${i}" inputmode="decimal" value="${e.limit ? esc(minorToInput(e.limit)) : ''}" placeholder="0,00"></label></div>
+      <div class="chips wrap" style="margin-top:6px">${cats.map((c) => `<button type="button" class="chip" data-envcat="${esc(c.id)}" data-i="${i}" aria-pressed="${(e.categoryIds || []).includes(c.id)}">${esc(c.icon || '')} ${esc(c.name)}</button>`).join('')}</div>
+      <button type="button" class="link neg" data-envdel="${i}" style="margin-top:6px">Usuń kopertę</button></div>`).join('');
+  };
+  openSheet('✉️ Koperty', `<p class="small muted" style="margin-top:0">Koperta = limit na miesiąc dla wybranych kategorii. Obowiązuje co miesiąc.</p>
+    <div id="env-list"></div>
+    <div class="chips wrap" style="margin:10px 0">${ENVELOPE_PRESETS.map((p, i) => `<button type="button" class="chip" data-envadd="${i}">+ ${p.icon} ${esc(p.name)}</button>`).join('')}<button type="button" class="chip" data-envadd="new">+ Własna</button></div>
+    <div class="err" id="env-err"></div>
+    <div class="actions"><button class="btn primary block" id="env-save">Zapisz koperty</button></div>`);
+  paint();
+  const sheet = $('#sheet');
+  sheet.oninput = (e) => {
+    const el = e.target.closest('[data-env]');
+    if (!el) return;
+    const i = Number(el.dataset.i);
+    if (el.dataset.env === 'limit') list[i].limit = el.value.trim() ? toMinor(el.value) : 0; else list[i][el.dataset.env] = el.value;
+  };
+  sheet.onclick = (e) => {
+    const c = e.target.closest('[data-envcat]');
+    if (c) { const i = Number(c.dataset.i); const ids = new Set(list[i].categoryIds || []); ids.has(c.dataset.envcat) ? ids.delete(c.dataset.envcat) : ids.add(c.dataset.envcat); list[i].categoryIds = [...ids]; c.setAttribute('aria-pressed', String(ids.has(c.dataset.envcat))); return; }
+    const d = e.target.closest('[data-envdel]');
+    if (d) { list.splice(Number(d.dataset.envdel), 1); paint(); return; }
+    const a = e.target.closest('[data-envadd]');
+    if (a) { const p = a.dataset.envadd === 'new' ? { name: 'Nowa koperta', icon: '✉️', categoryIds: [] } : ENVELOPE_PRESETS[Number(a.dataset.envadd)]; list.push({ ...p, id: db.newId('env'), limit: 0 }); paint(); }
+  };
+  $('#env-save').onclick = async () => {
+    const bad = list.find((e) => !e.name.trim() || !Number.isInteger(e.limit) || e.limit < 0);
+    if (bad) { $('#env-err').textContent = `Sprawdź kopertę „${bad.name || '?'}” (nazwa i limit).`; return; }
+    state.envelopes = list.filter((e) => e.limit > 0);
+    await db.setSetting('envelopes', state.envelopes);
+    closeSheet(); render(); toast('Zapisano koperty');
+  };
+}
+
+// ---------- Wieczorne przypomnienie ----------
+function eveningReminder() {
+  const today = todayISO();
+  if (new Date().getHours() < 19 || getPref('sf-evening', '1') !== '1') return '';
+  if (getPref('sf-evening-hide', '') === today) return '';
+  if (state.data.transactions.some((t) => !t.deletedAt && t.date === today) || (state.noSpendDays || []).includes(today)) return '';
+  const sug = smartSuggestions(state.data.transactions, new Date(), 3);
+  return `<div class="note evening">🌙 Nie wpisałeś dziś wydatków. Dodać szybko?
+    <div class="chips wrap" style="margin-top:8px">${sug.map((t) => `<button class="chip" data-action="quick-template" data-id="${esc(t.id)}">${catIco(t.categoryId, catById(), { mini: true })} ${esc(t.description)} · ${esc(formatMoney(t.amount))}</button>`).join('')}
+      <button class="chip" data-action="add">+ Inny</button></div>
+    <div class="actions two" style="grid-template-columns:1fr 1fr"><button class="btn" data-action="no-spend">✅ Nic dziś nie wydałem</button><button class="btn" data-action="evening-hide">Ukryj</button></div></div>`;
+}
+
+// ---------- Osiągnięcia: poziom, seria, odznaki, kapsuła, rok w pigułce ----------
+function achievementsStrip() {
+  const m = metrics();
+  const earned = Object.keys(state.badges || {}).length;
+  return `<button class="ach-strip" data-action="go-fun"><span>${m.level.icon} ${esc(m.level.name)}</span><span>🔥 ${m.streak.current} ${m.streak.current === 1 ? 'dzień' : 'dni'}</span><span>🏅 ${earned}/${BADGES.length}</span><span class="muted">›</span></button>`;
+}
+
+function viewFun() {
+  const m = metrics();
+  const lv = m.level;
+  const earned = state.badges || {};
+  const caps = state.capsules || [];
+  const year = Number(todayISO().slice(0, 4));
+  return `<section class="card hero"><h2>Twój poziom</h2>
+      <div class="big">${lv.icon} ${esc(lv.name)} <small style="font-size:16px;opacity:.8">poziom ${lv.index}</small></div>
+      ${lv.next ? `<div class="track light"><div class="fill" style="width:${(lv.progress * 100).toFixed(1)}%"></div></div>
+        <div class="foot">Do poziomu ${lv.next.icon} ${esc(lv.next.name)}: majątek netto ${esc(formatMoney(lv.next.amount).replace(',00', ''))} (brakuje <span class="num">${esc(formatMoney(Math.max(0, lv.next.amount - m.w.net)))}</span>)</div>` : '<div class="foot">Najwyższy poziom! 👑</div>'}
+    </section>
+    <section class="card"><h2>Seria</h2>
+      <div class="stat-row" style="grid-template-columns:1fr 1fr"><div class="stat"><small>Teraz</small><b>🔥 ${m.streak.current} dni</b></div><div class="stat"><small>Rekord</small><b>🏆 ${m.streak.best} dni</b></div></div>
+      <p class="small muted">Dzień liczy się, gdy wpiszesz transakcję albo oznaczysz „nic dziś nie wydałem”.</p>
+      ${m.streak.today ? '' : '<button class="btn block" data-action="no-spend">✅ Nic dziś nie wydałem</button>'}
+    </section>
+    <section class="card"><h2>Odznaki <span class="small muted">${Object.keys(earned).length}/${BADGES.length}</span></h2>
+      <div class="badges">${BADGES.map((b) => `<div class="badge-tile ${earned[b.id] ? 'on' : ''}" title="${esc(b.desc)}"><span>${b.icon}</span><b>${esc(b.name)}</b><small>${earned[b.id] ? esc(formatDatePL(earned[b.id])) : esc(b.desc)}</small></div>`).join('')}</div>
+    </section>
+    <section class="card"><h2>💌 Kapsuła czasu</h2>
+      <p class="small muted" style="margin-top:0">Napisz list do siebie. Otworzy się w wybranym dniu razem z porównaniem: majątek wtedy i teraz.</p>
+      ${caps.length ? `<ul class="menu">${caps.map((c) => `<li><button data-action="capsule-open" data-id="${esc(c.id)}"><span>${c.openOn <= todayISO() ? '📬' : '🔒'} List z ${esc(formatDatePL(c.created))}<span class="sub">${c.openOn <= todayISO() ? 'Można otworzyć' : 'Otworzy się ' + esc(formatDatePL(c.openOn))}</span></span>›</button></li>`).join('')}</ul>` : ''}
+      <button class="btn block" data-action="capsule-new">✍️ Napisz list</button>
+    </section>
+    <section class="card"><h2>🎁 Rok w pigułce</h2>
+      <p class="small muted" style="margin-top:0">Film z podsumowaniem roku: przychody, wydatki, ulubiony sklep, najdroższy miesiąc, rekordy i odznaki.</p>
+      <div class="actions two" style="grid-template-columns:1fr 1fr"><button class="btn" data-action="wrapped" data-y="${year - 1}">${year - 1}</button><button class="btn primary" data-action="wrapped" data-y="${year}">${year}</button></div>
+    </section>`;
+}
+
+/** Sprawdza odznaki; nowe świętuje (przy pierwszym uruchomieniu zapisuje po cichu). */
+async function checkBadges({ silent = false } = {}) {
+  const txs = liveTx();
+  const m = metrics();
+  const now = monthKey(todayISO());
+  let bestRate = 0;
+  for (let i = 0; i <= 12; i++) { const s = monthSummary(txs, addMonths(now, -i)); if (s.income > 0) bestRate = Math.max(bestRate, s.savingsRate); }
+  const ps = planSummary(state.data.bills, now);
+  const loans = state.data.accounts.filter((a) => a.type === 'loan');
+  const loanRepaid = loans.map((a) => { const orig = a.loanOriginal || -a.openingBalance; const left = -(m.w.values[a.id] ?? 0); return orig > 0 ? (orig - left) / orig : 0; });
+  const ids = earnedBadges({
+    txCount: txs.length, bestStreak: m.streak.best, plusMonthsBest: plusMonthsBest(txs, now), bestSavingsRate: bestRate, net: m.w.net,
+    cushionMonths: m.cu.months || 0, planAllPaid: ps.expense.count > 0 && ps.expense.left === 0 && ps.income.left === 0,
+    loanBestRepaid: Math.max(0, ...loanRepaid), loanPaidOff: loans.some((a) => (a.openingBalance < 0) && (m.w.values[a.id] ?? -1) >= 0),
+    goalReached: state.data.purchases.some((p) => p.status !== 'bought' && analyzePurchase(p, purchaseContext(p)).missing === 0),
+    pulse: m.pulse.score, capsules: (state.capsules || []).length,
+  });
+  const had = state.badges || {};
+  const fresh = ids.filter((id) => !had[id]);
+  if (!fresh.length) return;
+  const today = todayISO();
+  state.badges = { ...had, ...Object.fromEntries(fresh.map((id) => [id, today])) };
+  await db.setSetting('badges', state.badges);
+  if (silent) return;
+  const b = BADGES.find((x) => x.id === fresh[0]);
+  celebrate(`${b.icon} Nowa odznaka: ${b.name}${fresh.length > 1 ? ` (+${fresh.length - 1})` : ''}`);
+  if (state.view === 'dashboard' || state.view === 'fun') render();
+}
+
+function openCapsuleNew() {
+  openSheet('✍️ List do siebie', `
+    <label class="field"><span>Treść</span><textarea id="cap-text" rows="6" maxlength="2000" placeholder="Co planujesz? Na co odkładasz? Czego sobie życzysz za rok?"></textarea></label>
+    <div class="field"><span>Otwórz za</span><div class="seg" id="cap-when">${[[3, '3 mies.'], [6, '6 mies.'], [12, '1 rok'], [24, '2 lata']].map(([v, l]) => `<button type="button" data-m="${v}" aria-pressed="${v === 12}">${l}</button>`).join('')}</div></div>
+    <p class="small muted">Do listu dołączymy dzisiejszy majątek netto i odkładanie — przy otwarciu zobaczysz porównanie.</p>
+    <div class="err" id="cap-err"></div>
+    <div class="actions"><button class="btn primary block" id="cap-save">Zapieczętuj 💌</button></div>`);
+  let months = 12;
+  $('#cap-when').onclick = (e) => { const b = e.target.closest('[data-m]'); if (!b) return; months = Number(b.dataset.m); $('#cap-when').querySelectorAll('[data-m]').forEach((x) => x.setAttribute('aria-pressed', String(x === b))); };
+  focusLater('#cap-text');
+  $('#cap-save').onclick = async () => {
+    const text = $('#cap-text').value.trim();
+    if (!text) { $('#cap-err').textContent = 'Napisz kilka słów.'; return; }
+    const m = metrics();
+    const c = { id: db.newId('cap'), text, created: todayISO(), openOn: addMonthsDate(todayISO(), months), net: m.w.net, pulse: m.pulse.score, level: m.level.name, opened: false };
+    state.capsules = [...(state.capsules || []), c];
+    await db.setSetting('capsules', state.capsules);
+    closeSheet(); render(); toast(`Zapieczętowano. Otworzy się ${formatDatePL(c.openOn)} 💌`);
+    checkBadges();
+  };
+}
+
+async function openCapsule(id) {
+  const c = (state.capsules || []).find((x) => x.id === id);
+  if (!c) return;
+  if (c.openOn > todayISO()) { toast(`Ten list otworzy się ${formatDatePL(c.openOn)} 🔒`); return; }
+  const m = metrics();
+  const diff = m.w.net - c.net;
+  openSheet(`💌 List z ${formatDatePL(c.created)}`, `<div class="letter">${esc(c.text).replace(/\n/g, '<br>')}</div>
+    <h3 class="copy-h">Wtedy → teraz</h3>
+    <ul class="menu kv"><li><div><span>Majątek netto</span><span class="num">${esc(formatMoney(c.net))} → <b>${esc(formatMoney(m.w.net))}</b></span></div></li>
+      <li><div><span>Zmiana</span><span class="num ${diff >= 0 ? 'pos' : 'neg'}"><b>${esc(formatMoney(diff, 'PLN', { sign: true }))}</b></span></div></li>
+      <li><div><span>Puls finansowy</span><span>${c.pulse} → <b>${m.pulse.score}</b></span></div></li>
+      <li><div><span>Poziom</span><span>${esc(c.level)} → <b>${esc(m.level.icon)} ${esc(m.level.name)}</b></span></div></li></ul>`);
+  if (!c.opened) {
+    state.capsules = state.capsules.map((x) => (x.id === id ? { ...x, opened: true } : x));
+    await db.setSetting('capsules', state.capsules);
+    celebrate();
+  }
+}
+
+function capsuleNotice() {
+  const ready = (state.capsules || []).find((c) => !c.opened && c.openOn <= todayISO());
+  return ready ? `<button class="note capsule-note" data-action="capsule-open" data-id="${esc(ready.id)}">📬 Masz list z przeszłości (${esc(formatDatePL(ready.created))}). Dotknij, żeby otworzyć!</button>` : '';
+}
+
+function playWrapped(year) {
+  const y = yearSummary(state.data.transactions, state.data.categories, year);
+  if (!y.months) { toast(`Brak danych za ${year}`); return; }
+  const cats = catById();
+  const fmt = (v) => formatMoney(v).replace(/,\d\d(?=\s*zł)/, '');
+  const fmtSpeak = (v) => `${Math.round(v / 100).toLocaleString('pl-PL')} złotych`;
+  const hist = nwSeries().filter((h) => h.ym.startsWith(String(year)));
+  const s = simSettings();
+  const sim = runSim(s, simStart());
+  const earnedYear = Object.values(state.badges || {}).filter((d) => d.startsWith(String(year))).length;
+  playFilm($('#film-root'), {
+    title: `${state.profile?.name ? state.profile.name + ', ' : ''}Twój rok ${year}`, subtitle: 'Rok w pigułce 🎁',
+    netLabel: 'Odłożone w tym roku', net: y.net,
+    parts: [{ label: 'Przychody', value: y.income, color: '#7CF0B4' }, { label: 'Wydatki', value: -y.expense, color: '#FF9C8F' }, { label: 'Transakcje', value: 0 }],
+    historyLabel: 'Majątek w tym roku', history: hist.map((h) => ({ label: `${monthShortPL(h.ym)}`, net: h.net })),
+    m1: hist.length > 1 ? hist[hist.length - 1].net - hist[0].net : null, m1Label: 'przez rok',
+    analysisLabel: 'Twoje rekordy',
+    savingsRate: y.savingsRate,
+    topCategory: y.topCategory ? `${catLabel(y.topCategory.id, cats)} · ${fmt(y.topCategory.amount)}` : null,
+    rising: y.topShop ? `${y.topShop.name} (${y.topShop.count}×)` : null, risingLabel: 'Ulubione miejsce',
+    avgGrowth: null,
+    extra: y.priciest ? ['💸', 'Najdroższy miesiąc', `${monthNamePL(y.priciest.ym)} · ${fmt(y.priciest.amount)}`] : null,
+    future: sim.series.map((p) => ({ net: p.net })), futureYears: s.years, futureNet: sim.final.net,
+    payoffText: `🏅 Odznaki zdobyte w ${year}: ${earnedYear}`,
+    outro: y.net >= 0 ? `Dobry rok! Odłożone: ${fmt(y.net)} 🚀` : 'Nowy rok, nowe szanse 💪',
+    fmt, fmtSpeak,
+  }, { voice: getPref('sf-film-voice', '0') === '1' });
+}
+
+// ---------- Onboarding ----------
+const TOUR = [
+  ['👋', 'Witaj w Smart Finance', 'Twoje finanse w jednym miejscu. Dane zostają tylko w tym telefonie.'],
+  ['🏦', '1. Wpisz konta', 'W zakładce Majątek wpisz salda kont, oszczędności, kredyty i mieszkanie.'],
+  ['🗓️', '2. Zaplanuj miesiąc', 'W zakładce Miesiąc dodaj wpływy i rachunki. ✓ odhacza i od razu zapisuje transakcję.'],
+  ['➕', '3. Dodawaj wydatki', 'Przycisk + albo ⚡ Szybka aktualizacja: „Biedronka 87,40, paliwo 250”. Możesz też dyktować 🎤.'],
+  ['👆', '4. Przytrzymaj kafelek', 'Przytrzymanie dowolnego kafelka pokazuje więcej opcji. Przesuń transakcję w lewo, by usunąć, w prawo — by zduplikować.'],
+];
+function openTour(i = 0) {
+  const [icon, title, text] = TOUR[i];
+  openSheet(' ', `<div class="tour"><div class="tour-icon">${icon}</div><h2>${esc(title)}</h2><p>${esc(text)}</p>
+    <div class="tour-dots">${TOUR.map((_, k) => `<i class="${k === i ? 'on' : ''}"></i>`).join('')}</div>
+    <div class="actions two"><button class="btn" data-action="tour-end">Pomiń</button><button class="btn primary" data-action="tour-next" data-i="${i + 1}">${i === TOUR.length - 1 ? 'Zaczynamy! 🚀' : 'Dalej'}</button></div></div>`);
+}
+
+// ---------- Gesty na liście transakcji ----------
+function setupSwipe() {
+  let el = null; let sx = 0; let sy = 0; let dx = 0; let locked = null;
+  document.addEventListener('pointerdown', (e) => {
+    const it = e.target.closest('#tx-list .item[data-lp^="tx:"]');
+    if (!it || e.pointerType === 'mouse') return;
+    el = it; sx = e.clientX; sy = e.clientY; dx = 0; locked = null;
+  });
+  document.addEventListener('pointermove', (e) => {
+    if (!el) return;
+    const mx = e.clientX - sx; const my = e.clientY - sy;
+    if (!locked) { if (Math.abs(mx) > 12 && Math.abs(mx) > Math.abs(my) * 1.5) locked = 'x'; else if (Math.abs(my) > 12) { locked = 'y'; el = null; return; } else return; }
+    dx = mx;
+    el.style.transform = `translateX(${dx}px)`;
+    el.dataset.swipe = dx < -80 ? 'del' : dx > 80 ? 'dup' : '';
+    suppressClick = true;
+  });
+  const end = () => {
+    if (!el) return;
+    const it = el; const id = it.dataset.lp.slice(3); const act = it.dataset.swipe;
+    el = null;
+    it.style.transition = 'transform .2s'; it.style.transform = '';
+    setTimeout(() => { it.style.transition = ''; delete it.dataset.swipe; }, 220);
+    if (act === 'del') deleteTx(id); else if (act === 'dup') duplicateTx(id);
+  };
+  document.addEventListener('pointerup', end);
+  document.addEventListener('pointercancel', () => { if (el) { el.style.transform = ''; el = null; } });
+}
+
+// ---------- Analiza: subskrypcje, prognoza, PIT ----------
+function analysisExtrasHtml() {
+  const now = monthKey(todayISO());
+  const subs = detectSubscriptions(state.data.transactions, { endYm: now });
+  const yearly = subs.reduce((s, x) => s + x.yearly, 0);
+  const f = monthForecast({ transactions: state.data.transactions, bills: state.data.bills, ym: now, today: todayISO() });
+  const year = state.taxYear || Number(todayISO().slice(0, 4)) - (Number(todayISO().slice(5, 7)) <= 4 ? 1 : 0);
+  const r = taxReport({ transactions: state.data.transactions, accounts: state.data.accounts, categories: state.data.categories, year });
+  return `<section class="card"><h2>🔮 Prognoza: ${esc(monthNamePL(now).toLowerCase())}</h2>
+      <ul class="menu kv"><li><div><span>Przychody (z planem)</span><span class="num pos">${esc(formatMoney(f.income))}</span></div></li>
+        <li><div><span>Wydatki: dotąd + tempo ${esc(formatMoney(f.perDay))}/dzień + do zapłaty</span><span class="num neg">${esc(formatMoney(f.expense))}</span></div></li>
+        <li><div><span><b>Na koniec miesiąca</b></span><span class="num ${f.net >= 0 ? 'pos' : 'neg'}"><b>${esc(formatMoney(f.net, 'PLN', { sign: true }))}</b></span></div></li></ul>
+      <p class="small muted">Szacunek: wydatki spoza planu liczone średnim tempem z dotychczasowych dni.</p></section>
+    <section class="card"><h2>🔁 Subskrypcje i stałe płatności</h2>
+      ${subs.length ? `<div class="big-result"><b class="num">${esc(formatMoney(yearly))}</b><span>rocznie (${esc(formatMoney(Math.round(yearly / 12)))} miesięcznie)</span></div>
+        <ul class="menu kv">${subs.map((x) => `<li><div><span>${esc(x.name)} <small class="muted">· ${x.months} mies.</small></span><span class="num">${esc(formatMoney(x.amount))}/mies. · <b>${esc(formatMoney(x.yearly))}</b>/rok</span></div></li>`).join('')}</ul>
+        <p class="small muted">Wykryte z powtarzających się wydatków o podobnej kwocie. Sprawdź, czy wszystkich używasz 😉</p>`
+        : '<p class="small muted">Nie wykryto subskrypcji. Pojawią się, gdy ta sama płatność powtórzy się w kilku miesiącach.</p>'}</section>
+    <section class="card"><h2>🧾 Do zeznania PIT <span><button class="link" data-action="tax-year" data-y="${year - 1}">‹</button> ${year} <button class="link" data-action="tax-year" data-y="${year + 1}">›</button></span></h2>
+      <ul class="menu kv">
+        <li><div><span>Wpłaty na IKZE <small class="muted">(odliczenie od dochodu)</small></span><span class="num"><b>${esc(formatMoney(r.ikze))}</b></span></div></li>
+        <li><div><span>Wpłaty na IKE <small class="muted">(bez odliczenia, zwolnione z Belki)</small></span><span class="num">${esc(formatMoney(r.ike))}</span></div></li>
+        <li><div><span>Wpłaty na PPK</span><span class="num">${esc(formatMoney(r.ppk))}</span></div></li>
+        <li><div><span>Darowizny <small class="muted">(${r.donations.length})</small></span><span class="num">${esc(formatMoney(r.donationsSum))}</span></div></li>
+        <li><div><span>Termomodernizacja / fotowoltaika <small class="muted">(${r.thermo.length})</small></span><span class="num">${esc(formatMoney(r.thermoSum))}</span></div></li>
+        <li><div><span>Internet <small class="muted">(ulga do 760 zł)</small></span><span class="num">${esc(formatMoney(r.internetDeductible))}</span></div></li>
+        <li><div><span>Przychody w roku</span><span class="num">${esc(formatMoney(r.income))}</span></div></li>
+      </ul>
+      <p class="small muted">Zestawienie pomocnicze z Twoich zapisów (darowizny i termomodernizacja rozpoznane po opisie/tagu, np. „darowizna”, „fotowoltaika”). Limity i warunki ulg sprawdź w aktualnych przepisach lub u doradcy — to nie jest porada podatkowa.</p></section>`;
+}
+
+// ---------- Co, jeśli? ----------
+function whatIfHtml() {
+  const s = simSettings();
+  const st = simStart();
+  const w = state.whatIf || { cut: 0, overpay: 0, extra: 0 };
+  const base = runSim(s, st);
+  const mod = runSim({ ...s, monthly: (s.monthly != null ? s.monthly : Math.max(0, st.avg.net) / 100) + w.cut + w.extra, overpay: (s.overpay || 0) + w.overpay }, st);
+  const diff = mod.final.net - base.final.net;
+  const payBase = base.payoffs.filter((p) => p.month != null); const payMod = mod.payoffs;
+  const saved = payBase.map((p) => { const m = payMod.find((x) => x.name === p.name); return m?.month != null ? { name: p.name, months: p.month - m.month } : null; }).filter((x) => x && x.months > 0);
+  const slider = (key, label, max, step) => `<label class="field"><span>${label}: <b id="wi-${key}-out">${w[key]} zł/mies.</b></span><input type="range" data-wi="${key}" min="0" max="${max}" step="${step}" value="${w[key]}"></label>`;
+  return `<section class="card" id="whatif"><h2>🤔 Co, jeśli…?</h2>
+    ${slider('cut', 'Wydaję mniej o', 2000, 50)}${slider('extra', 'Dodatkowo odkładam', 3000, 50)}${slider('overpay', 'Nadpłacam kredyty', 3000, 50)}
+    <div id="wi-out">${whatIfResult(diff, mod, saved, s)}</div></section>`;
+}
+function whatIfResult(diff, mod, saved, s) {
+  return `<div class="big-result"><b class="num ${diff >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(diff, 'PLN', { sign: true }).replace(/,\d\d/, ''))}</b><span>więcej majątku za ${s.years} lat (razem ok. ${esc(formatMoney(mod.final.net).replace(/,\d\d/, ''))})</span></div>
+    ${saved.map((x) => `<p class="small">🔓 ${esc(x.name)}: spłata szybciej o <b>${x.months} mies.</b></p>`).join('')}
+    ${diff > 0 ? `<p class="small muted">${equivalents(diff, 3, 2).map((e) => `${e.icon} ${String(e.count).replace('.', ',')} ${esc(e.label)}`).join(' · ')}</p>` : ''}`;
+}
+function bindWhatIf() {
+  const box = $('#whatif');
+  if (!box) return;
+  box.oninput = (e) => {
+    const el = e.target.closest('[data-wi]');
+    if (!el) return;
+    state.whatIf = { ...(state.whatIf || { cut: 0, overpay: 0, extra: 0 }), [el.dataset.wi]: Number(el.value) };
+    $(`#wi-${el.dataset.wi}-out`).textContent = `${el.value} zł/mies.`;
+    const s = simSettings(); const st = simStart(); const w = state.whatIf;
+    const base = runSim(s, st);
+    const mod = runSim({ ...s, monthly: (s.monthly != null ? s.monthly : Math.max(0, st.avg.net) / 100) + w.cut + w.extra, overpay: (s.overpay || 0) + w.overpay }, st);
+    const saved = base.payoffs.filter((p) => p.month != null).map((p) => { const m = mod.payoffs.find((x) => x.name === p.name); return m?.month != null ? { name: p.name, months: p.month - m.month } : null; }).filter((x) => x && x.months > 0);
+    $('#wi-out').innerHTML = whatIfResult(mod.final.net - base.final.net, mod, saved, s);
+  };
+}
+
 // ---------- Ustawienia ----------
 function getPref(key, fallback) {
   try { return localStorage.getItem(key) || fallback; } catch { return fallback; }
@@ -2766,6 +3294,11 @@ function viewSettings() {
           <option value="">Ostatnio używane</option>
           ${accOpts.map((a) => `<option value="${esc(a.id)}" ${state.prefs.defaultAccount === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}
         </select></div>
+      <div class="row-set"><span>Dźwięki<span class="sub">Moneta przy odkładaniu, fanfary przy odznakach</span></span>${sw('set-sounds', getPref('sf-sounds', '1') === '1', 'sounds-toggle')}</div>
+      <div class="row-set"><span>Wieczorne przypomnienie<span class="sub">Po 19:00, gdy nie ma dziś wpisów</span></span>${sw('set-evening', getPref('sf-evening', '1') === '1', 'evening-toggle')}</div>
+      <div class="row-set"><span>Cel poduszki (miesiące)</span><select id="set-cushion">${[3, 4, 6, 9, 12].map((v) => `<option ${String(v) === getPref('sf-cushion-goal', '6') ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+      <div class="row-set"><span>Chcę odkładać miesięcznie<span class="sub">Odejmowane w „Ile mogę dziś wydać”</span></span><input id="set-savegoal" inputmode="decimal" style="max-width:110px;border:1px solid var(--line);background:var(--bg);border-radius:12px;padding:10px;min-height:44px" value="${esc(getPref('sf-save-goal', '0'))}"></div>
+      <ul class="menu"><li><button data-action="undo"><span>↩️ Historia zmian (cofnij)</span>›</button></li><li><button data-action="tour"><span>🎓 Pokaż samouczek</span>›</button></li><li><button data-action="go-fun"><span>🏅 Osiągnięcia, kapsuła czasu, rok w pigułce</span>›</button></li></ul>
       <div class="row-set"><span>Wibracja przy przytrzymaniu</span>${sw('set-vibrate', getPref('sf-vibrate', '1') === '1', 'vibrate-toggle')}</div>
       <div class="row-set"><span>Odhaczenie ✓ w planie dodaje transakcję<span class="sub">Wpływ → przychód, opłata → wydatek. Odznaczenie usuwa ją do kosza</span></span>${sw('set-autotx', getPref('sf-autotx', '1') === '1', 'autotx-toggle')}</div>
       <p class="small muted" style="margin:8px 0 0">💡 Przytrzymaj kafelek (transakcję, rachunek, konto, kartę na stronie startowej), żeby zobaczyć więcej opcji.</p>
@@ -2963,7 +3496,7 @@ async function duplicateTx(id) {
   const now = new Date().toISOString();
   const copy = { ...t, id: db.newId('tx'), date: todayISO(), createdAt: now, updatedAt: now };
   delete copy.deletedAt;
-  await db.put('transactions', copy);
+  await dbPut('transactions', copy);
   state.month = monthKey(copy.date);
   await reload();
   toast('Zduplikowano', { label: 'Edytuj', run: () => openTxSheet(copy.id) });
@@ -2972,9 +3505,9 @@ async function duplicateTx(id) {
 async function deleteTx(id) {
   const t = state.data.transactions.find((x) => x.id === id);
   if (!t) return;
-  await db.put('transactions', { ...t, deletedAt: new Date().toISOString() });
+  await dbPut('transactions', { ...t, deletedAt: new Date().toISOString() });
   await reload();
-  toast('Przeniesiono do kosza', { label: 'Cofnij', run: async () => { await db.put('transactions', t); await reload(); } });
+  toast('Przeniesiono do kosza', { label: 'Cofnij', run: async () => { await dbPut('transactions', t); await reload(); } });
 }
 
 async function copyBillTo(id, month) {
@@ -2982,7 +3515,7 @@ async function copyBillTo(id, month) {
   if (!b) return;
   const exists = state.data.bills.some((x) => x.month === month && kindOf(x) === kindOf(b) && x.name.trim().toLowerCase() === b.name.trim().toLowerCase());
   if (exists && month !== b.month) { toast(`„${b.name}” już jest na liście: ${monthNamePL(month).toLowerCase()}`); return; }
-  await db.put('bills', { ...b, id: db.newId('bill'), month, paid: false, paidAt: null, txId: null, createdAt: new Date().toISOString(), order: Date.now() });
+  await dbPut('bills', { ...b, id: db.newId('bill'), month, paid: false, paidAt: null, txId: null, createdAt: new Date().toISOString(), order: Date.now() });
   await reload();
   toast(month === b.month ? 'Zduplikowano' : `Skopiowano na ${monthNamePL(month).toLowerCase()}`);
 }
@@ -2990,17 +3523,17 @@ async function copyBillTo(id, month) {
 async function deleteBill(id) {
   const b = state.data.bills.find((x) => x.id === id);
   if (!b) return;
-  await db.remove('bills', id);
+  await dbRemove('bills', id);
   await reload();
-  toast('Usunięto z listy', { label: 'Cofnij', run: async () => { await db.put('bills', b); await reload(); } });
+  toast('Usunięto z listy', { label: 'Cofnij', run: async () => { await dbPut('bills', b); await reload(); } });
 }
 
 async function archiveAccount(id) {
   const a = accById()[id];
   if (!a) return;
-  await db.put('accounts', { ...a, archived: true });
+  await dbPut('accounts', { ...a, archived: true });
   await reload();
-  toast(`Zarchiwizowano: ${a.name}`, { label: 'Cofnij', run: async () => { await db.put('accounts', a); await reload(); } });
+  toast(`Zarchiwizowano: ${a.name}`, { label: 'Cofnij', run: async () => { await dbPut('accounts', a); await reload(); } });
 }
 
 function openCategoriesSheet(kind) {
@@ -3043,7 +3576,7 @@ function openCategorySheet(id, kind) {
       archived: c ? $('#c-arch').checked : false,
       image: pick.get() || null,
     };
-    await db.put('categories', item);
+    await dbPut('categories', item);
     await reload();
     openCategoriesSheet(kind);
     toast('Zapisano kategorię');
@@ -3106,7 +3639,7 @@ async function openTxSheet(id, opts = {}) {
   const accOptions = (sel) => state.data.accounts.filter((a) => !a.archived || a.id === sel)
     .map((a) => `<option value="${esc(a.id)}" ${a.id === sel ? 'selected' : ''}>${esc(a.name)} (${esc(a.currency)})</option>`).join('')
     + `<option value="" ${!sel ? 'selected' : ''}>— tylko zapis (poza kontami) —</option>`;
-  const recent = existing ? [] : recentTemplates();
+  const recent = existing ? [] : smartSuggestions(state.data.transactions, new Date(), 6);
 
   openSheet(existing ? 'Edytuj transakcję' : 'Nowa transakcja', `
     <div class="seg" id="t-type">
@@ -3255,7 +3788,7 @@ async function openTxSheet(id, opts = {}) {
     if (!tr && !t.categoryId) errors.push('Wybierz kategorię');
     if (errors.length) { $('#t-err').textContent = errors.join(' · '); return; }
     try {
-      await db.put('transactions', t);
+      await dbPut('transactions', t);
       if (t.accountId) await db.setSetting('lastAccount', t.accountId);
     } catch (err) {
       $('#t-err').textContent = 'Nie udało się zapisać: ' + err.message;
@@ -3269,14 +3802,14 @@ async function openTxSheet(id, opts = {}) {
 
   if (existing) {
     $('#t-del').onclick = async () => {
-      await db.put('transactions', { ...existing, deletedAt: new Date().toISOString() });
+      await dbPut('transactions', { ...existing, deletedAt: new Date().toISOString() });
       closeSheet();
       await reload();
       toast('Przeniesiono do kosza', {
         label: 'Cofnij',
         run: async () => {
           const { deletedAt, ...restored } = existing;
-          await db.put('transactions', restored);
+          await dbPut('transactions', restored);
           await reload();
         },
       });
@@ -3386,6 +3919,32 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'undo': openUndoSheet(); break;
+    case 'undo-at': closeSheet(); undoAt(Number(el.dataset.i)); break;
+    case 'pulse-info': openPulseSheet(); break;
+    case 'envelopes': openEnvelopesSheet(); break;
+    case 'go-fun': location.hash = '#fun'; break;
+    case 'capsule-new': openCapsuleNew(); break;
+    case 'capsule-open': openCapsule(el.dataset.id); break;
+    case 'wrapped': playWrapped(Number(el.dataset.y)); break;
+    case 'tax-year': state.taxYear = Number(el.dataset.y); render(); break;
+    case 'tour-next': { const i = Number(el.dataset.i); if (i >= TOUR.length) { closeSheet(); setPref('sf-tour', '1'); } else openTour(i); break; }
+    case 'tour-end': closeSheet(); setPref('sf-tour', '1'); break;
+    case 'tour': openTour(0); break;
+    case 'no-spend': {
+      const t = todayISO();
+      if (!(state.noSpendDays || []).includes(t)) { state.noSpendDays = [...(state.noSpendDays || []), t].slice(-400); await db.setSetting('noSpendDays', state.noSpendDays); }
+      render(); toast('Zapisano dzień bez wydatków 💪 Seria trwa!'); checkBadges();
+      break;
+    }
+    case 'evening-hide': setPref('sf-evening-hide', todayISO()); render(); break;
+    case 'quick-template': {
+      const t = state.data.transactions.find((x) => x.id === el.dataset.id);
+      if (t) openTxSheet(null, { quick: `${t.description} ${minorToInput(t.amount)}` });
+      break;
+    }
+    case 'sounds-toggle': setPref('sf-sounds', el.checked ? '1' : '0'); break;
+    case 'evening-toggle': setPref('sf-evening', el.checked ? '1' : '0'); break;
     case 'to-property': moveToProperty(el.dataset.id); break;
     case 'dep-payout': depositAction('payout', el.dataset.id); break;
     case 'dep-renew': depositAction('renew', el.dataset.id); break;
@@ -3414,10 +3973,10 @@ async function onAction(e) {
       const acc = accById()[el.dataset.id];
       if (!acc) break;
       const removed = (acc.valuations || []).find((v) => v.date === el.dataset.date);
-      await db.put('accounts', { ...acc, valuations: (acc.valuations || []).filter((v) => v.date !== el.dataset.date) });
+      await dbPut('accounts', { ...acc, valuations: (acc.valuations || []).filter((v) => v.date !== el.dataset.date) });
       await reload();
       openAccountDetail(acc.id);
-      toast('Usunięto wycenę', { label: 'Cofnij', run: async () => { const cur = accById()[acc.id]; await db.put('accounts', { ...cur, valuations: [...(cur.valuations || []), removed] }); await reload(); } });
+      toast('Usunięto wycenę', { label: 'Cofnij', run: async () => { const cur = accById()[acc.id]; await dbPut('accounts', { ...cur, valuations: [...(cur.valuations || []), removed] }); await reload(); } });
       break;
     }
     case 'refresh-prices': refreshMetalPrices({ force: true, silent: false }); break;
@@ -3547,7 +4106,7 @@ async function onAction(e) {
     case 'restore-tx': {
       const t = state.data.transactions.find((x) => x.id === el.dataset.id);
       const { deletedAt, ...restored } = t;
-      await db.put('transactions', restored);
+      await dbPut('transactions', restored);
       await reload();
       openTrashSheet();
       toast('Przywrócono');
@@ -3557,8 +4116,8 @@ async function onAction(e) {
       const n = state.data.transactions.filter((t) => t.deletedAt).length;
       const na = state.deletedAccounts.length;
       if (await confirmSheet('Opróżnić kosz?', `Trwale usunąć ${n} transakcji${na ? ` i ${na} kont` : ''}? Tego nie da się cofnąć.`, { confirmLabel: 'Usuń trwale', danger: true })) {
-        for (const t of state.data.transactions.filter((x) => x.deletedAt)) await db.remove('transactions', t.id);
-        for (const a of state.deletedAccounts) await db.remove('accounts', a.id);
+        for (const t of state.data.transactions.filter((x) => x.deletedAt)) await dbRemove('transactions', t.id);
+        for (const a of state.deletedAccounts) await dbRemove('accounts', a.id);
         await reload();
         toast('Kosz opróżniony');
       }
@@ -3614,6 +4173,8 @@ async function init() {
   setupLongPress();
   document.addEventListener('toggle', (e) => { const d = e.target; if (d.matches?.('details.pos')) state.openPos = { ...state.openPos, [d.dataset.pos]: d.open }; }, true);
   document.addEventListener('change', async (e) => {
+    if (e.target.id === 'set-cushion') { setPref('sf-cushion-goal', e.target.value); toast('Zapisano'); return; }
+    if (e.target.id === 'set-savegoal') { const v = Number(e.target.value.replace(',', '.')); setPref('sf-save-goal', Number.isFinite(v) && v >= 0 ? String(v) : '0'); toast('Zapisano'); return; }
     if (e.target.id === 'set-locktime') {
       const cfg = lockCfg();
       if (cfg) saveLockCfg({ ...cfg, timeout: Number(e.target.value) });
@@ -3650,6 +4211,10 @@ async function init() {
     state.simSettings = await db.getSetting('simSettings', null);
     state.profile = await db.getSetting('profile', null);
     state.snapshots = (await db.getSetting('nwSnapshots', null)) || {};
+    state.badges = (await db.getSetting('badges', null)) || null;
+    state.capsules = (await db.getSetting('capsules', null)) || [];
+    state.envelopes = (await db.getSetting('envelopes', null)) || [];
+    state.noSpendDays = (await db.getSetting('noSpendDays', null)) || [];
     if (state.profile?.name) setPref('sf-name', state.profile.name);
     state.prefs.defaultAccount = await db.getSetting('defaultAccount', '') || '';
     await loadData();
@@ -3663,10 +4228,17 @@ async function init() {
   biometricAvailable().then((v) => { state.bioAvailable = v; if (state.view === 'settings') render(); });
   if (hasMetals() || hasCrypto() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
   saveSnapshot().catch(() => {});
+  setupSwipe();
+  // każde nowe dotknięcie = nowa pozycja w historii zmian
+  document.addEventListener('pointerdown', () => { undoGroup = null; }, true);
+  const firstBadges = state.badges == null;
+  if (firstBadges) state.badges = {};
+  checkBadges({ silent: firstBadges }).catch(() => {});
   await locked;
   if (shortcut === 'expense' || shortcut === 'income') openTxSheet(null, { type: shortcut });
   else if (shortcut === 'voice') openTxSheet(null, { voice: true });
   else if (shortcut === 'batch') openBatchSheet();
+  else if (getPref('sf-tour', '') !== '1' && !state.data.transactions.length) openTour(0);
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline niedostępny — aplikacja działa dalej */ });
   }

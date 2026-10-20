@@ -12,10 +12,16 @@ export const DASH_CARDS = {
   purchases: { label: 'Do kupienia', icon: '🛒' },
   metals: { label: 'Złoto i srebro', icon: '🥇' },
   nwchart: { label: 'Majątek w czasie (wykres)', icon: '📈' },
+  pulse: { label: 'Puls finansowy i poduszka', icon: '❤️' },
+  allowance: { label: 'Ile mogę dziś wydać + prognoza', icon: '💸' },
+  piggy: { label: 'Skarbonka', icon: '🐷' },
+  envelopes: { label: 'Koperty', icon: '✉️' },
 };
 
 export const DEFAULT_LAYOUT = [
+  { id: 'allowance', visible: true },
   { id: 'balance', visible: true },
+  { id: 'pulse', visible: true },
   { id: 'bills', visible: true },
   { id: 'networth', visible: true },
   { id: 'categories', visible: true },
@@ -26,6 +32,8 @@ export const DEFAULT_LAYOUT = [
   { id: 'purchases', visible: false },
   { id: 'metals', visible: false },
   { id: 'nwchart', visible: false },
+  { id: 'piggy', visible: false },
+  { id: 'envelopes', visible: false },
 ];
 
 /** Naprawia zapisany układ: usuwa nieznane/zdublowane karty, dopisuje nowe na końcu. */

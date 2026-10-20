@@ -162,7 +162,7 @@ export function playFilm(root, data, opts = {}) {
       const p = ease(seg(t, 3, 6));
       const val = Math.round(data.net * p);
       if (audio && !muted && p < 1 && t - lastTick > 0.07) { audio.tick(); lastTick = t; }
-      text('Majątek netto', cx, H * 0.16, 18, { w: 600, color: C.soft });
+      text(data.netLabel || 'Majątek netto', cx, H * 0.16, 18, { w: 600, color: C.soft });
       const s = data.fmt(val);
       text(s, cx, H * 0.24, fit(s, 44, cw), { color: val < 0 ? C.neg : C.ink });
       const parts = data.parts.filter((x) => x.value !== 0);
@@ -177,7 +177,7 @@ export function playFilm(root, data, opts = {}) {
       });
     } else if (sc === 2) {
       const p = ease(seg(t, 9, 14.5));
-      text('Droga do dziś', cx, H * 0.14, 22);
+      text(data.historyLabel || 'Droga do dziś', cx, H * 0.14, 22);
       const vals = data.history.map((h) => h.net);
       const box = { x: pad, y: H * 0.25, w: cw, h: H * 0.42 };
       g.strokeStyle = C.faint; g.lineWidth = 1; g.strokeRect(box.x, box.y, box.w, box.h);
@@ -189,17 +189,18 @@ export function playFilm(root, data, opts = {}) {
       }
       if (data.m1 != null) {
         const a = ease(seg(t, 14, 15));
-        const s = `${data.m1 >= 0 ? '+' : '−'}${data.fmt(Math.abs(data.m1))} w tym miesiącu`;
+        const s = `${data.m1 >= 0 ? '+' : '−'}${data.fmt(Math.abs(data.m1))} ${data.m1Label || 'w tym miesiącu'}`;
         text(s, cx, H * 0.8, fit(s, 22, cw), { alpha: a, color: data.m1 >= 0 ? C.pos : C.neg });
       }
     } else if (sc === 3) {
-      text('Analiza', cx, H * 0.14, 22);
+      text(data.analysisLabel || 'Analiza', cx, H * 0.14, 22);
       const items = [
         data.savingsRate != null ? ['💰', 'Odkładasz z dochodu', `${Math.round(data.savingsRate * 100)}%`] : null,
         data.topCategory ? ['🛒', 'Najwięcej wydajesz na', data.topCategory] : null,
-        data.rising ? ['📈', 'Najbardziej wzrosło', data.rising] : null,
+        data.rising ? ['📈', data.risingLabel || 'Najbardziej wzrosło', data.rising] : null,
+        data.extra || null,
         data.avgGrowth != null ? ['📊', 'Średnio miesięcznie', `${data.avgGrowth >= 0 ? '+' : '−'}${data.fmt(Math.abs(data.avgGrowth))}`] : null,
-      ].filter(Boolean);
+      ].filter(Boolean).slice(0, 4);
       items.forEach(([ic, label, val], i) => {
         const a = ease(seg(t, 16.3 + i * 0.9, 17.1 + i * 0.9));
         const y = H * 0.27 + i * 92 + (1 - a) * 30;

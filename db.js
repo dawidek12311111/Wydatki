@@ -72,6 +72,15 @@ export async function remove(store, id) {
   return done(tx);
 }
 
+export async function get(store, id) {
+  const db = await open();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(store).objectStore(store).get(id);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 export async function getSetting(key, fallback = null) {
   const db = await open();
   return new Promise((resolve, reject) => {
