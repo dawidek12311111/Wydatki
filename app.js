@@ -10,12 +10,13 @@ import { parseQuick, guessCategory } from './parse.js';
 import { validateTransaction, validateBackup, validateBill, validatePurchase } from './validate.js';
 import { transactionsToCSV } from './csv.js';
 import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
-import { kindOf, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
+import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, logoUrl, normalizeDomain, CorsBlockedError, IMAGE_HOSTS } from './images.js';
+import { kindOf, paidWithoutTx, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
 import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS } from './purchases.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.5.0';
+export const APP_VERSION = '0.6.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -58,6 +59,18 @@ function catLabel(id, cats = catById()) {
 function catIcon(id, cats = catById()) {
   return cats[id]?.icon || '•';
 }
+/** Ikona: obrazek (jeśli jest i jest bezpieczny) albo emoji. mini = mały, w linii tekstu. */
+function ico(emoji, image, { mini = false } = {}) {
+  const img = sanitizeImage(image);
+  if (img) return `<img class="${mini ? 'ico-mini' : 'ico-img'}" src="${esc(img)}" alt="" loading="lazy" referrerpolicy="no-referrer">`;
+  return esc(emoji || '•');
+}
+function catIco(id, cats = catById(), opts) {
+  return ico(catIcon(id, cats), cats[id]?.image, opts);
+}
+function txIco(t, cats = catById()) {
+  return t.type === 'transfer' ? '⇄' : catIco(t.categoryId, cats);
+}
 function txIcon(t, cats) {
   if (t.type === 'transfer') return '⇄';
   return catIcon(t.categoryId, cats);
@@ -91,7 +104,7 @@ function txRow(t, cats = catById(), accs = accById()) {
   const amt = t.type === 'transfer' ? formatMoney(t.amount, t.currency) : formatMoney(signedAmount(t), t.currency, { sign: true });
   const badges = `${t.refund ? '<span class="badge">zwrot</span>' : ''}${t.recurring ? '<span class="badge">cykl.</span>' : ''}`;
   return `<button class="item" data-action="edit-tx" data-id="${esc(t.id)}" data-lp="tx:${esc(t.id)}">
-    <span class="ico" aria-hidden="true">${esc(txIcon(t, cats))}</span>
+    <span class="ico" aria-hidden="true">${txIco(t, cats)}</span>
     <span class="mid"><span class="t1">${esc(title)}${badges}</span><span class="t2">${esc(sub)}</span></span>
     <span class="amt num ${amountClass(t)}">${esc(amt)}</span>
   </button>`;
@@ -199,7 +212,8 @@ function viewDashboard() {
           <div class="stat"><small>Do zapłaty</small><b class="${ps.expense.left > 0 ? 'neg' : 'pos'}">${money(ps.expense.left)}</b><small>${ps.expense.doneCount}/${ps.expense.count} opłacone</small></div>
           <div class="stat"><small>Zostanie</small><b class="${ps.plannedNet < 0 ? 'neg' : ''}">${money(ps.plannedNet)}</b><small>wg planu</small></div>
         </div>
-        ${open.length ? `<p class="small muted" style="margin:10px 0 0">Czeka: ${open.slice(0, 4).map((b) => esc(b.icon || '') + ' ' + esc(b.name)).join(', ')}${open.length > 4 ? '…' : ''}</p>` : ''}`
+        ${open.length ? `<p class="small muted" style="margin:10px 0 0">Czeka: ${open.slice(0, 4).map((b) => ico(b.icon, b.image, { mini: true }) + ' ' + esc(b.name)).join(', ')}${open.length > 4 ? '…' : ''}</p>` : ''}
+        ${missingTxNotice(state.month, { short: true })}`
         : '<p class="muted small">Brak planu na ten miesiąc. <a class="link" href="#budget">Zaplanuj</a></p>'}
       </section>`;
     },
@@ -210,7 +224,7 @@ function viewDashboard() {
       return `<section class="card" ${lp('purchases')}><h2>Do kupienia <a href="#plans" data-action="plans-tab" data-tab2="buy">Plany ›</a></h2>
         ${list.length ? `<ul class="bars">${list.map((p) => {
           const a = analyzePurchase(p, purchaseContext(p));
-          return `<li><div class="row"><span>${esc(p.icon || '🛒')} ${esc(p.name)}</span><span class="num">${Math.round(a.progress * 100)}%</span></div>
+          return `<li><div class="row"><span>${ico(p.icon || '🛒', p.image, { mini: true })} ${esc(p.name)}</span><span class="num">${Math.round(a.progress * 100)}%</span></div>
             <div class="track"><div class="fill" style="width:${(a.progress * 100).toFixed(1)}%"></div></div>
             <div class="small muted">${a.missing === 0 ? 'Masz już całą kwotę' : a.affordYm ? 'Szacunkowo: ' + esc(monthNamePL(a.affordYm).toLowerCase()) : 'brakuje ' + esc(formatMoney(a.missing))}</div></li>`;
         }).join('')}</ul>` : '<p class="muted small">Brak planowanych zakupów.</p>'}</section>`;
@@ -246,7 +260,7 @@ function viewDashboard() {
       if (!byParent.length) return `<section class="card" ${lp('categories')}><h2>Na co poszło</h2><p class="muted small">Brak wydatków w tym miesiącu.</p></section>`;
       const max = byParent[0][1];
       return `<section class="card" ${lp('categories')}><h2>Na co poszło <a href="#analytics">Więcej ›</a></h2><ul class="bars">${byParent.slice(0, 6).map(([id, v]) => `
-        <li><div class="row"><span>${esc(catIcon(id, cats))} ${esc(catLabel(id, cats))}</span><span class="num">${esc(formatMoney(v))}</span></div>
+        <li><div class="row"><span>${catIco(id, cats, { mini: true })} ${esc(catLabel(id, cats))}</span><span class="num">${esc(formatMoney(v))}</span></div>
         <div class="track"><div class="fill" style="width:${Math.max(2, (v / max) * 100).toFixed(1)}%"></div></div></li>`).join('')}</ul></section>`;
     },
 
@@ -331,7 +345,7 @@ function planRow(b) {
   const openLabel = inc ? 'Jeszcze nie wpłynęło' : 'Niezapłacone';
   return `<div class="item bill ${b.paid ? 'is-paid' : ''}" data-lp="bill:${esc(b.id)}">
     <button class="bill-main" data-action="edit-bill" data-id="${esc(b.id)}">
-      <span class="ico" aria-hidden="true">${esc(b.icon || (inc ? '💰' : '📄'))}</span>
+      <span class="ico" aria-hidden="true">${ico(b.icon || (inc ? '💰' : '📄'), b.image)}</span>
       <span class="mid"><span class="t1">${esc(b.name)}${linked ? '<span class="badge">w transakcjach</span>' : ''}</span>
       <span class="t2"><span class="num ${inc ? 'pos' : ''}">${inc ? '+' : ''}${esc(formatMoney(b.amount))}</span>${b.day ? ` · ${b.day}. dnia` : ''}${b.note ? ' · ' + esc(b.note) : ''}</span></span>
     </button>
@@ -362,10 +376,38 @@ function viewBudget() {
       </div>
       <div class="foot">Tyle zostanie po planowanych opłatach. Na dziś: <b class="num">${esc(formatMoney(s.doneNet, 'PLN', { sign: true }))}</b></div>
     </section>
+    ${missingTxNotice(ym)}
     ${toCopy.length ? `<button class="btn primary block" data-action="copy-bills">⧉ Skopiuj z: ${esc(monthNamePL(prevYm).toLowerCase())} (${toCopy.length})</button>` : ''}
     ${section('income', incomes, 'Wpływy', s.income.done, s.income.total)}
     ${section('expense', expenses, 'Do zapłaty', s.expense.done, s.expense.total)}
     <p class="note">Dotknij ✕ / ✓, żeby zmienić status${autoTxOn() ? ' — odhaczenie od razu dodaje transakcję (przychód lub wydatek), odznaczenie ją usuwa' : ''}. Nazwa miesiąca u góry otwiera kalendarz, strzałki przenoszą na kolejny miesiąc.</p>`;
+}
+
+/** Ostrzeżenie: odhaczone pozycje, które nie mają transakcji (np. odhaczone w starszej wersji aplikacji). */
+function missingTxNotice(ym, { short = false } = {}) {
+  if (!autoTxOn()) return '';
+  const list = paidWithoutTx(state.data.bills, state.data.transactions, ym);
+  if (!list.length) return '';
+  const inc = list.filter((b) => kindOf(b) === 'income').reduce((s, b) => s + b.amount, 0);
+  const exp = list.filter((b) => kindOf(b) === 'expense').reduce((s, b) => s + b.amount, 0);
+  if (short) return `<p class="small neg" style="margin:10px 0 0">⚠ ${list.length} odhaczonych pozycji nie liczy się jeszcze do bilansu. <a class="link" href="#budget">Napraw ›</a></p>`;
+  return `<div class="note warn">⚠ <b>${list.length} odhaczonych pozycji nie ma transakcji</b> (np. odhaczone w starszej wersji), więc nie zmniejszają bilansu ani salda konta${exp ? ` — wydatki: <span class="num">${esc(formatMoney(exp))}</span>` : ''}${inc ? `, wpływy: <span class="num">${esc(formatMoney(inc))}</span>` : ''}.
+    <div class="actions"><button class="btn primary block" data-action="plan-fix-tx">Dodaj brakujące transakcje</button></div>
+    <span class="small">Jeśli te wydatki wpisałeś już ręcznie w Transakcjach, nie dodawaj — policzyłyby się podwójnie.</span></div>`;
+}
+
+async function fixMissingPlanTx() {
+  const list = paidWithoutTx(state.data.bills, state.data.transactions, state.month);
+  let n = 0;
+  for (const b of list) {
+    const item = { ...b, txId: null };
+    item.txId = await syncPlanTx(item);
+    if (item.txId) n++;
+    await db.put('bills', item);
+    state.data = await db.loadAll(); // świeże dane dla kolejnej pozycji
+  }
+  await reload();
+  toast(`Dodano ${n} transakcji — bilans i saldo konta są już aktualne`);
 }
 
 /** Tworzy, aktualizuje albo usuwa transakcję powiązaną z pozycją planu. Zwraca nowe txId. */
@@ -386,7 +428,12 @@ async function syncPlanTx(item) {
     const now = new Date().toISOString();
     const t = {
       id: db.newId('tx'), createdAt: now, updatedAt: now,
-      ...autoTransaction({ ...item, categoryId }, { today: todayISO(), accountId: defaultAccountId(), fallbackCategory: categoryId }),
+      ...autoTransaction({ ...item, categoryId }, {
+        today: todayISO(),
+        paidDate: item.paidAt ? todayISO(new Date(item.paidAt)) : null,
+        accountId: defaultAccountId(),
+        fallbackCategory: categoryId,
+      }),
     };
     const errors = validateTransaction(t, state.data);
     if (errors.length) { toast('Nie dodano transakcji: ' + errors.join(', ')); return null; }
@@ -413,9 +460,10 @@ function openBillSheet(id, kindArg) {
       <label class="field"><span>Dzień miesiąca (opcj.)</span><input id="bl-day" type="number" inputmode="numeric" min="1" max="31" placeholder="np. 10" value="${b?.day || ''}"></label>
       <label class="field"><span>Konto</span><select id="bl-acc"><option value="">Domyślne</option>${accs.map((a) => `<option value="${esc(a.id)}" ${b?.accountId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
     </div>
-    <details class="more" ${b?.note || (b?.icon && kind === 'expense') ? 'open' : ''}><summary>Ikona i notatka</summary>
+    <details class="more" ${b?.note || b?.image || (b?.icon && kind === 'expense') ? 'open' : ''}><summary>Ikona, obrazek i notatka</summary>
       <div class="field"><span>Ikona</span><div class="icongrid" id="bl-icons">${BILL_ICONS.map((i) => `<button type="button" data-icon="${i}">${i}</button>`).join('')}</div>
         <input id="bl-icon-custom" maxlength="4" placeholder="lub wpisz własne emoji" value="${b?.icon && !BILL_ICONS.includes(b.icon) ? esc(b.icon) : ''}"></div>
+      ${imagePickerHtml()}
       <label class="field"><span>Notatka</span><input id="bl-note" maxlength="80" value="${esc(b?.note || '')}" placeholder="np. termin, nr umowy"></label>
     </details>
     <label class="check"><input type="checkbox" id="bl-paid" ${b?.paid ? 'checked' : ''}> <span id="bl-paid-label"></span></label>
@@ -425,6 +473,7 @@ function openBillSheet(id, kindArg) {
       <button class="btn primary block" id="bl-save">${b ? 'Zapisz' : 'Dodaj'}</button>
     </div>`);
   const sheet = $('#sheet');
+  const pick = mountImagePicker(b?.image);
   const cats = () => state.data.categories.filter((c) => c.kind === kind && (!c.archived || c.id === categoryId));
   const paintIcons = () => sheet.querySelectorAll('#bl-icons [data-icon]').forEach((x) => x.setAttribute('aria-pressed', String(x.dataset.icon === icon)));
   const paint = () => {
@@ -434,7 +483,7 @@ function openBillSheet(id, kindArg) {
     $('#bl-cat-label').textContent = kind === 'income' ? 'Rodzaj wpływu' : 'Kategoria (do transakcji)';
     $('#bl-paid-label').textContent = kind === 'income' ? 'Już wpłynęło' : 'Już zapłacone';
     if (categoryId && !cats().some((c) => c.id === categoryId)) categoryId = null;
-    $('#bl-cats').innerHTML = cats().map((c) => `<button type="button" class="cat" data-cat="${esc(c.id)}" aria-pressed="${c.id === categoryId}"><b>${esc(c.icon || '•')}</b>${esc(c.name)}</button>`).join('');
+    $('#bl-cats').innerHTML = cats().map((c) => `<button type="button" class="cat" data-cat="${esc(c.id)}" aria-pressed="${c.id === categoryId}"><b>${ico(c.icon || '•', c.image)}</b>${esc(c.name)}</button>`).join('');
     paintIcons();
   };
   paint();
@@ -479,6 +528,7 @@ function openBillSheet(id, kindArg) {
       day: dayRaw ? Number(dayRaw) : null,
       accountId: $('#bl-acc').value || null,
       note: $('#bl-note').value.trim(),
+      image: pick.get() || null,
       paid: $('#bl-paid').checked,
     };
     item.paidAt = item.paid ? (b?.paidAt || new Date().toISOString()) : null;
@@ -510,7 +560,7 @@ function openCopySheet() {
   const fromYm = addMonths(state.month, -1);
   const items = planToCopy(state.data.bills, fromYm, state.month);
   const row = (b, i) => `<div class="copy-row">
-    <label><input type="checkbox" data-copy="${i}" checked> <span>${esc(b.icon || '')} ${esc(b.name)}${b.day ? `<small class="muted"> · ${b.day}.</small>` : ''}</span></label>
+    <label><input type="checkbox" data-copy="${i}" checked> <span>${ico(b.icon, b.image, { mini: true })} ${esc(b.name)}${b.day ? `<small class="muted"> · ${b.day}.</small>` : ''}</span></label>
     <input class="copy-amt" data-amt="${i}" inputmode="decimal" value="${esc(minorToInput(b.amount))}" aria-label="Kwota: ${esc(b.name)}">
   </div>`;
   const group = (kind, title) => {
@@ -578,7 +628,7 @@ function viewWealth() {
     const m = accountMonth(a, txs, ym);
     return `<section class="acard" data-lp="acc:${esc(a.id)}">
       <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
-        <span class="ico">${esc(accountIcon(a))}</span>
+        <span class="ico">${ico(accountIcon(a), a.image)}</span>
         <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
         <span class="amt num">${esc(formatMoney(m.after, a.currency))}</span>
       </button>
@@ -630,7 +680,7 @@ function viewWealth() {
 
     <div class="sec-head"><h2>Konta bieżące</h2><b class="num">${esc(formatMoney(sumPLN(current, (a) => bal[a.id])))}</b></div>
     <div class="list">${current.map((a) => `<button class="item" data-action="account-detail" data-id="${esc(a.id)}" data-lp="acc:${esc(a.id)}">
-      <span class="ico">${esc(accountIcon(a))}</span>
+      <span class="ico">${ico(accountIcon(a), a.image)}</span>
       <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}</span></span>
       <span class="amt num ${bal[a.id] < 0 ? 'neg' : ''}">${esc(formatMoney(bal[a.id], a.currency))}</span></button>`).join('')}</div>
     <div class="actions"><button class="btn block" data-action="add-account" data-group="current">+ Dodaj konto</button></div>
@@ -670,9 +720,11 @@ function openAccountSheet(id, group) {
       <p class="small muted">Saldo początkowe = ile było na koncie, zanim zacząłeś zapisywać transakcje.</p>`;
   }
   openSheet(title, `${body}
+    ${imagePickerHtml()}
     ${a ? `<label class="check"><input type="checkbox" id="a-arch" ${a.archived ? 'checked' : ''}> Zarchiwizuj (ukryj, historia zostaje)</label>` : ''}
     <div class="err" id="a-err" role="alert"></div>
     <div class="actions"><button class="btn primary block" id="a-save">Zapisz</button></div>`);
+  const pick = mountImagePicker(a?.image);
   const kinds = $('#a-kind');
   if (kinds) {
     kinds.onclick = (e) => {
@@ -712,6 +764,7 @@ function openAccountSheet(id, group) {
       item.type = $('#a-type').value;
     }
     item.openingBalance = opening;
+    item.image = pick.get() || null;
     await db.put('accounts', item);
     closeSheet();
     await reload();
@@ -812,7 +865,7 @@ function viewAnalytics() {
   const changes = categoryChanges(cur, prev, state.data.categories).filter((c) => c.diff !== 0);
   const up = changes.filter((c) => c.diff > 0).slice(0, 4);
   const down = changes.filter((c) => c.diff < 0).sort((a, b) => a.diff - b.diff).slice(0, 3);
-  const diffLine = (c) => `<li><div class="row"><span>${esc(catIcon(c.categoryId, cats))} ${esc(catLabel(c.categoryId, cats))}</span>
+  const diffLine = (c) => `<li><div class="row"><span>${catIco(c.categoryId, cats, { mini: true })} ${esc(catLabel(c.categoryId, cats))}</span>
     <span class="num ${c.diff > 0 ? 'neg' : 'pos'}">${esc(formatMoney(c.diff, 'PLN', { sign: true }))}</span></div>
     <div class="small muted">${esc(formatMoney(c.before))} → ${esc(formatMoney(c.now))}</div></li>`;
 
@@ -995,7 +1048,7 @@ function purchaseCard(p) {
   else when = '<span class="muted">Brak nadwyżki do oszacowania terminu</span>';
   return `<section class="acard" data-lp="buy:${esc(p.id)}">
     <button class="acard-head" data-action="purchase-detail" data-id="${esc(p.id)}">
-      <span class="ico">${esc(p.icon || '🛒')}</span>
+      <span class="ico">${ico(p.icon || '🛒', p.image)}</span>
       <span class="mid"><span class="t1">${esc(p.name)} <span class="badge prio-${esc(p.priority || 'mid')}">${esc(PRIORITIES[p.priority] || 'Średni')}</span></span>
       <span class="t2">${esc(STATUSES[p.status] || 'Pomysł')}${p.notes ? ' · ' + esc(p.notes) : ''}</span></span>
       <span class="amt num">${esc(formatMoney(a.price))}</span>
@@ -1069,6 +1122,7 @@ function openPurchaseSheet(id) {
   openSheet(p ? 'Edytuj zakup' : 'Do kupienia', `
     <label class="field"><span>Co chcesz kupić</span><input id="pu-name" maxlength="60" value="${esc(p?.name || '')}" placeholder="np. Auto, Fotowoltaika, Kuchnia"></label>
     <div class="field"><span>Ikona</span><div class="icongrid" id="pu-icons">${PURCHASE_ICONS.map((i) => `<button type="button" data-icon="${i}" aria-pressed="${i === icon}">${i}</button>`).join('')}</div></div>
+    ${imagePickerHtml()}
     <label class="field"><span>Cena</span><input id="pu-price" class="amount-input" inputmode="decimal" placeholder="0,00" value="${mi(p?.price)}"></label>
     <div class="field"><span>Priorytet</span>${seg('prio', PRIORITIES, priority)}</div>
     <div class="field"><span>Status</span>${seg('status', STATUSES, status)}</div>
@@ -1094,6 +1148,7 @@ function openPurchaseSheet(id) {
     <div class="err" id="pu-err" role="alert"></div>
     <div class="actions ${p ? 'two' : ''}">${p ? '<button class="btn danger" id="pu-del">Usuń</button>' : ''}<button class="btn primary block" id="pu-save">Zapisz</button></div>`);
   const sheet = $('#sheet');
+  const pick = mountImagePicker(p?.image);
   const paintSaved = () => { $('#pu-saved-wrap').hidden = !!$('#pu-acc').value; };
   paintSaved();
   $('#pu-acc').onchange = paintSaved;
@@ -1128,6 +1183,7 @@ function openPurchaseSheet(id) {
       loanOwn: optMoney('#pu-own'),
       monthlyBenefit: optMoney('#pu-benefit'),
       notes: $('#pu-notes').value.trim(),
+      image: pick.get() || null,
       updatedAt: new Date().toISOString(),
     };
     if (status === 'bought' && !item.boughtAt) item.boughtAt = new Date().toISOString();
@@ -1223,6 +1279,86 @@ async function askAI(question) {
 function showAIData() {
   openSheet('Co wysyłam do AI', `<p class="small muted" style="margin-top:0">Dokładnie te dane (kwoty w złotych) dołączane są do każdego pytania. Bez opisów transakcji, nazw kont i numerów.</p>
     <pre class="json">${esc(JSON.stringify(currentAIContext(), null, 2))}</pre>`);
+}
+
+// ---------- Wybór obrazka (konta, plan, zakupy, kategorie) ----------
+function imagePickerHtml() {
+  return `<div class="field imgpick"><span>Obrazek (opcjonalnie — zastępuje ikonę)</span>
+    <div class="imgpick-row"><div class="img-prev" id="img-prev"></div>
+      <div class="img-btns">
+        <button type="button" class="btn" data-img="file">📷 Z telefonu</button>
+        <button type="button" class="btn" data-img="logo">🏢 Logo firmy</button>
+        <button type="button" class="btn" data-img="url">🔗 Z linku</button>
+        <button type="button" class="btn danger" data-img="clear">Usuń obrazek</button>
+      </div></div>
+    <div id="img-extra"></div>
+    <p class="small muted" id="img-status"></p>
+    <input type="file" id="img-file" accept="image/*" hidden>
+  </div>`;
+}
+
+function mountImagePicker(initial) {
+  let current = sanitizeImage(initial);
+  const box = $('#sheet .imgpick');
+  const status = (html, cls = 'muted') => { const el = $('#img-status'); el.className = 'small ' + cls; el.innerHTML = html; };
+  const paint = () => {
+    $('#img-prev').innerHTML = current ? `<img src="${esc(current)}" alt="" referrerpolicy="no-referrer">` : '<span class="muted small">brak</span>';
+    box.querySelector('[data-img="clear"]').hidden = !current;
+  };
+  paint();
+  if (current && !isLocalImage(current)) status('Ten obrazek jest wyświetlany bezpośrednio z serwera.');
+  const fetchInto = async (url, fit) => {
+    status('Pobieram…');
+    try {
+      current = await imageFromUrl(url, fit);
+      paint();
+      status('✓ Zapisano małą kopię w telefonie — obrazek nie będzie już pobierany z sieci.', 'pos');
+    } catch (err) {
+      if (err instanceof CorsBlockedError) {
+        status(`${esc(err.message)} Możesz wyświetlać go bezpośrednio z serwera <b>${esc(new URL(url).hostname)}</b> — wtedy przy każdym wyświetleniu telefon pobierze z niego ten obrazek (serwer nie dostaje żadnych Twoich danych finansowych). <button type="button" class="link" id="img-remote">Użyj z serwera</button> — albo zapisz obrazek w telefonie i wybierz „Z telefonu”.`, 'neg');
+        $('#img-remote').onclick = () => { current = url; paint(); status('Obrazek będzie wyświetlany z serwera.'); };
+      } else {
+        status(esc(err.message), 'neg');
+      }
+    }
+  };
+  box.onclick = (e) => {
+    const b = e.target.closest('[data-img]');
+    if (!b) return;
+    const kind = b.dataset.img;
+    const extra = $('#img-extra');
+    if (kind === 'file') { $('#img-file').click(); return; }
+    if (kind === 'clear') { current = null; extra.innerHTML = ''; paint(); status(''); return; }
+    if (kind === 'logo') {
+      extra.innerHTML = `<div class="qa"><input id="img-domain" placeholder="adres strony, np. mbank.pl" autocomplete="off" autocapitalize="off" inputmode="url"><button type="button" class="btn primary" id="img-go">Pobierz</button></div>
+        <p class="small muted">Logo z DuckDuckGo. Wysyłana jest tylko nazwa strony — żadne Twoje dane.</p>`;
+      $('#img-go').onclick = () => {
+        const u = logoUrl($('#img-domain').value);
+        if (!u) { status('Wpisz adres strony, np. orlen.pl', 'neg'); return; }
+        fetchInto(u, 'contain');
+      };
+      $('#img-domain').focus();
+    } else if (kind === 'url') {
+      extra.innerHTML = `<div class="qa"><input id="img-url" placeholder="https://…" autocomplete="off" autocapitalize="off" inputmode="url"><button type="button" class="btn primary" id="img-go">Pobierz</button></div>
+        <p class="small muted">Dozwolone darmowe serwery: ${IMAGE_HOSTS.map(esc).join(', ')} oraz Twoja strona *.github.io. Inne adresy są blokowane dla ochrony danych.</p>`;
+      $('#img-go').onclick = () => fetchInto($('#img-url').value.trim(), 'cover');
+      $('#img-url').focus();
+    }
+  };
+  $('#img-file').onchange = async (e) => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f) return;
+    status('Przetwarzam…');
+    try {
+      current = await imageFromFile(f);
+      paint();
+      status('✓ Zapisano w telefonie (nic nie zostało wysłane do sieci).', 'pos');
+    } catch (err) {
+      status(esc(err.message), 'neg');
+    }
+  };
+  return { get: () => current };
 }
 
 // ---------- Ustawienia ----------
@@ -1494,7 +1630,7 @@ async function archiveAccount(id) {
 function openCategoriesSheet(kind) {
   const cats = state.data.categories.filter((c) => c.kind === kind);
   const tops = cats.filter((c) => !c.parentId).sort((a, b) => a.name.localeCompare(b.name, 'pl'));
-  const row = (c, child) => `<li><button data-action="edit-cat" data-id="${esc(c.id)}"><span>${child ? '&nbsp;&nbsp;↳ ' : ''}${esc(c.icon || '')} ${esc(c.name)}${c.archived ? ' <span class="badge">ukryta</span>' : ''}</span>›</button></li>`;
+  const row = (c, child) => `<li><button data-action="edit-cat" data-id="${esc(c.id)}"><span>${child ? '&nbsp;&nbsp;↳ ' : ''}${ico(c.icon, c.image, { mini: true })} ${esc(c.name)}${c.archived ? ' <span class="badge">ukryta</span>' : ''}</span>›</button></li>`;
   openSheet(kind === 'expense' ? 'Kategorie wydatków' : 'Kategorie przychodów', `
     <ul class="menu">${tops.map((p) => row(p) + cats.filter((c) => c.parentId === p.id).map((c) => row(c, true)).join('')).join('')}</ul>
     <div class="actions"><button class="btn primary block" data-action="new-cat" data-kind="${kind}">+ Nowa kategoria</button></div>`);
@@ -1515,9 +1651,11 @@ function openCategorySheet(id, kind) {
       ${parents.map((p) => `<option value="${esc(p.id)}" ${c?.parentId === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}</select></label>
     <label class="field"><span>Słowa kluczowe (po przecinku) — do rozpoznawania z tekstu</span>
       <input id="c-kw" value="${esc((c?.keywords || []).join(', '))}" placeholder="np. orlen, bp, tankowanie"></label>
+    ${imagePickerHtml()}
     ${c ? `<label class="check"><input type="checkbox" id="c-arch" ${c.archived ? 'checked' : ''}> Ukryj kategorię (historia zostaje)</label>` : ''}
     <div class="err" id="c-err"></div>
     <div class="actions"><button class="btn primary block" id="c-save">Zapisz</button></div>`);
+  const pick = mountImagePicker(c?.image);
   $('#c-save').onclick = async () => {
     const name = $('#c-name').value.trim();
     if (!name) { $('#c-err').textContent = 'Podaj nazwę.'; return; }
@@ -1527,6 +1665,7 @@ function openCategorySheet(id, kind) {
       parentId: $('#c-parent').value || null,
       keywords: $('#c-kw').value.split(',').map((s) => s.trim()).filter(Boolean),
       archived: c ? $('#c-arch').checked : false,
+      image: pick.get() || null,
     };
     await db.put('categories', item);
     await reload();
@@ -1539,7 +1678,7 @@ function openTrashSheet() {
   const cats = catById();
   const del = state.data.transactions.filter((t) => t.deletedAt).sort((a, b) => b.deletedAt.localeCompare(a.deletedAt));
   openSheet('Kosz', del.length ? `
-    <div class="list">${del.map((t) => `<div class="item"><span class="ico">${esc(txIcon(t, cats))}</span>
+    <div class="list">${del.map((t) => `<div class="item"><span class="ico">${txIco(t, cats)}</span>
       <span class="mid"><span class="t1">${esc(t.description || catLabel(t.categoryId, cats))}</span><span class="t2">${esc(formatDatePL(t.date))} · ${esc(formatMoney(t.amount, t.currency))}</span></span>
       <button class="link" data-action="restore-tx" data-id="${esc(t.id)}">Przywróć</button></div>`).join('')}</div>
     <div class="actions"><button class="btn danger block" data-action="empty-trash">Opróżnij kosz (nieodwracalne)</button></div>`
@@ -1596,7 +1735,7 @@ async function openTxSheet(id, opts = {}) {
     </div>
     ${existing ? '' : `<div class="quick"><input id="t-quick" placeholder="Szybko: „Paliwo 250 zł dzisiaj”" autocomplete="off" enterkeyhint="done"></div>
     <div class="quick-hint" id="t-hint"></div>`}
-    ${recent.length ? `<div class="chips" style="margin-top:6px">${recent.map((t, i) => `<button type="button" class="chip" data-recent="${i}">${esc(catIcon(t.categoryId))} ${esc(t.description)}</button>`).join('')}</div>` : ''}
+    ${recent.length ? `<div class="chips" style="margin-top:6px">${recent.map((t, i) => `<button type="button" class="chip" data-recent="${i}">${catIco(t.categoryId, catById(), { mini: true })} ${esc(t.description)}</button>`).join('')}</div>` : ''}
     <label class="field"><span>Kwota</span><input id="t-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(f.amount)}" autocomplete="off"></label>
     <div id="t-cat-wrap" class="field"><span>Kategoria</span><div class="catgrid" id="t-cats"></div></div>
     <div class="grid2">
@@ -1630,7 +1769,7 @@ async function openTxSheet(id, opts = {}) {
     const all = catById();
     const list = cats().sort((a, b) => (usage[b.id] || 0) - (usage[a.id] || 0) || a.name.localeCompare(b.name, 'pl'));
     $('#t-cats').innerHTML = list.map((c) => `<button type="button" class="cat" data-cat="${esc(c.id)}" aria-pressed="${c.id === f.categoryId}">
-      <b>${esc(c.icon || '•')}</b>${esc(c.name)}${c.parentId && all[c.parentId] ? `<small class="muted">${esc(all[c.parentId].name)}</small>` : ''}</button>`).join('')
+      <b>${ico(c.icon || '•', c.image)}</b>${esc(c.name)}${c.parentId && all[c.parentId] ? `<small class="muted">${esc(all[c.parentId].name)}</small>` : ''}</button>`).join('')
       || '<p class="muted small">Brak kategorii — dodaj w Ustawieniach.</p>';
   }
   function paintType() {
@@ -1860,6 +1999,7 @@ async function onAction(e) {
     case 'edit-bill': openBillSheet(el.dataset.id); break;
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
+    case 'plan-fix-tx': fixMissingPlanTx(); break;
     case 'plans-tab':
       state.plansTab = el.dataset.tab2;
       if (state.view !== 'plans') location.hash = '#plans'; else render();

@@ -38,9 +38,11 @@ export function planToCopy(bills, fromYm, toYm) {
  * Transakcja tworzona przy odhaczeniu pozycji planu.
  * Data: dziś, jeśli to bieżący miesiąc; inaczej dzień z planu (albo 1.) w tym miesiącu.
  */
-export function autoTransaction(item, { today, accountId, fallbackCategory }) {
+export function autoTransaction(item, { today, paidDate = null, accountId, fallbackCategory }) {
   const kind = kindOf(item);
-  const date = today.slice(0, 7) === item.month ? today : dateInMonth(item.month, item.day);
+  // kolejność: dzień odhaczenia (jeśli w tym miesiącu) → dziś (jeśli bieżący miesiąc) → dzień z planu
+  const date = paidDate && paidDate.slice(0, 7) === item.month ? paidDate
+    : today.slice(0, 7) === item.month ? today : dateInMonth(item.month, item.day);
   return {
     type: kind,
     amount: item.amount,
@@ -103,4 +105,10 @@ export function yearTiles(transactions, bills, year) {
     out.push({ ym, actual: hasTx ? s.net : null, plan: hasPlan ? p.plannedNet : null, source: hasTx ? 'actual' : hasPlan ? 'plan' : null });
   }
   return out;
+}
+
+/** Odhaczone pozycje bez (żywej) powiązanej transakcji — np. odhaczone w starszej wersji aplikacji. */
+export function paidWithoutTx(bills, transactions, ym) {
+  const live = new Set(transactions.filter(isLive).map((t) => t.id));
+  return bills.filter((b) => b.month === ym && b.paid && !(b.txId && live.has(b.txId)));
 }
