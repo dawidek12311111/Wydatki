@@ -23,8 +23,19 @@ function open() {
         }
       }
     };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const db = req.result;
+      // inna karta / nowsza wersja aplikacji chce zaktualizować bazę — zwalniamy ją i przeładowujemy
+      db.onversionchange = () => { db.close(); location.reload(); };
+      resolve(db);
+    };
+    req.onerror = () => {
+      dbPromise = null;
+      const e = req.error;
+      reject(e && e.name === 'VersionError'
+        ? new Error('Na telefonie jest nowsza baza niż ta wersja aplikacji. Zamknij aplikację całkowicie i otwórz ponownie.')
+        : e);
+    };
     req.onblocked = () => reject(new Error('Zamknij inne karty z aplikacją i spróbuj ponownie.'));
   });
   return dbPromise;

@@ -1,15 +1,18 @@
 // Service worker: pozwala uruchomić aplikację bez internetu.
 // Przy każdej zmianie plików aplikacji zwiększ VERSION — telefon pobierze nową wersję.
-const VERSION = 'sf-v0.3.0';
+const VERSION = 'sf-v0.4.0';
 const FILES = [
   './', './index.html', './manifest.webmanifest', './style.css',
   './app.js', './db.js', './calc.js', './money.js', './dates.js',
-  './parse.js', './validate.js', './csv.js', './defaults.js',
+  './parse.js', './validate.js', './csv.js', './defaults.js', './layout.js',
   './icon-192.png', './icon-512.png', './icon-maskable-512.png',
 ];
 
 self.addEventListener('install', (e) => {
-  e.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' — pobieramy wszystkie pliki naraz z serwera, żeby nie mieszać starych i nowych wersji
+  e.waitUntil(caches.open(VERSION)
+    .then((c) => c.addAll(FILES.map((f) => new Request(f, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (e) => {
@@ -23,7 +26,7 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET' || new URL(req.url).origin !== location.origin) return;
   e.respondWith(
-    fetch(req)
+    fetch(req.url, { cache: 'no-cache', credentials: 'same-origin' })
       .then((res) => {
         if (res.ok) {
           const copy = res.clone();
