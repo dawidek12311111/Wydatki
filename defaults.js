@@ -49,6 +49,8 @@ export const SAVINGS_KINDS = {
   etf: { label: 'ETF / fundusze', icon: '📈', type: 'investment' },
   bonds: { label: 'Obligacje skarbowe', icon: '📜', type: 'investment' },
   crypto: { label: 'Kryptowaluty', icon: '🪙', type: 'investment' },
+  gold: { label: 'Złoto', icon: '🥇', type: 'investment' },
+  silver: { label: 'Srebro', icon: '🥈', type: 'investment' },
   other: { label: 'Inne', icon: '💰', type: 'investment' },
 };
 

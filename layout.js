@@ -10,6 +10,7 @@ export const DASH_CARDS = {
   categories: { label: 'Na co poszło', icon: '🍰' },
   recent: { label: 'Ostatnie transakcje', icon: '🧾' },
   purchases: { label: 'Do kupienia', icon: '🛒' },
+  metals: { label: 'Złoto i srebro', icon: '🥇' },
 };
 
 export const DEFAULT_LAYOUT = [
@@ -22,6 +23,7 @@ export const DEFAULT_LAYOUT = [
   { id: 'savings', visible: false },
   { id: 'loans', visible: false },
   { id: 'purchases', visible: false },
+  { id: 'metals', visible: false },
 ];
 
 /** Naprawia zapisany układ: usuwa nieznane/zdublowane karty, dopisuje nowe na końcu. */

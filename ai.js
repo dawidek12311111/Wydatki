@@ -11,7 +11,8 @@ const API = 'https://generativelanguage.googleapis.com/v1beta/models/';
 const zl = (minor) => Math.round(minor) / 100; // grosze -> złote (liczba)
 
 /** Zagregowany kontekst finansowy wysyłany do modelu. */
-export function buildAIContext(data, ym, { purchases = [], purchaseAnalysis = {} } = {}) {
+export function buildAIContext(data, ym, opts = {}) {
+  const { purchases = [], purchaseAnalysis = {} } = opts;
   const txs = data.transactions.filter(isLive);
   const cats = Object.fromEntries(data.categories.map((c) => [c.id, c.name]));
   const catName = (id) => cats[id] || 'Bez kategorii';
@@ -21,10 +22,10 @@ export function buildAIContext(data, ym, { purchases = [], purchaseAnalysis = {}
     .filter(([, v]) => v !== 0).sort((a, b) => b[1] - a[1]).map(([id, v]) => [catName(id), zl(v)]));
   const prevYm = addMonths(ym, -1);
   const avg = (n) => { const a = averages(txs, prevYm, n); return { miesiecy_z_danymi: a.months, przychody: zl(a.income), wydatki: zl(a.expense), nadwyzka: zl(a.net) }; };
-  const bal = balances(data.accounts, txs);
+  const bal = { ...balances(data.accounts, txs), ...(opts.values || {}) };
   const live = data.accounts.filter((a) => !a.archived && a.currency === 'PLN');
   const sumGroup = (g) => zl(live.filter((a) => accountGroup(a) === g).reduce((s, a) => s + bal[a.id], 0));
-  const w = netWorth(data.accounts, txs);
+  const w = opts.netWorth || netWorth(data.accounts, txs);
   const plan = planSummary(data.bills || [], ym);
 
   return {

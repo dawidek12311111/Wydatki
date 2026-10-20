@@ -403,3 +403,16 @@ pre.json { background: var(--surface-2); border-radius: 12px; padding: 12px; fon
 .img-btns .btn { min-height: 40px; padding: 8px 6px; font-size: 13px; }
 #img-extra .qa { margin-top: 8px; }
 #img-status:empty { display: none; }
+
+/* v0.7: wyceny, metale, symulacja */
+.acard-actions.three { grid-template-columns: 1fr 1fr 1fr; }
+.acard-actions.three .btn { font-size: 13px; padding: 8px 4px; }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.grid3 .field { margin-top: 6px; }
+.big-result { display: grid; gap: 2px; margin: 4px 0 6px; }
+.big-result b { font-size: 30px; letter-spacing: -.02em; }
+.big-result span { color: var(--muted); font-size: 14px; }
+input[type=range] { width: 100%; accent-color: var(--accent); min-height: 32px; }
+#va-preview b { font-size: 17px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.plans-seg button { white-space: nowrap; font-size: 12.5px; padding: 10px 2px; }

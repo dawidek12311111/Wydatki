@@ -12,11 +12,14 @@ import { transactionsToCSV } from './csv.js';
 import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
 import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, logoUrl, normalizeDomain, CorsBlockedError, IMAGE_HOSTS } from './images.js';
 import { kindOf, paidWithoutTx, planSummary, planToCopy, autoTransaction, calendarGrid, dayMarks, yearTiles } from './plan.js';
-import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS } from './purchases.js';
+import { analyzePurchase, PRIORITIES, STATUSES, PURCHASE_ICONS, loanInstallment } from './purchases.js';
+import { metalOf, accountValue, bookBalance, investmentResult, valuedNetWorth, applyChange, sortedValuations, metalValue, TROY_OUNCE_G } from './valuation.js';
+import { refreshPrices } from './prices.js';
+import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '0.6.0';
+export const APP_VERSION = '0.7.0';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -25,6 +28,10 @@ const money = (m, cur = 'PLN', o) => `<span class="num">${esc(formatMoney(m, cur
 const state = {
   data: { accounts: [], categories: [], transactions: [], budgets: [], bills: [], purchases: [] },
   plansTab: 'buy',
+  prices: null,
+  priceProblems: [],
+  simSettings: null,
+  metalChart: 'gold',
   buyFilter: 'active',
   view: 'dashboard',
   month: monthKey(todayISO()),
@@ -158,6 +165,7 @@ function render() {
     wealth: viewWealth, plans: viewPlans, settings: viewSettings,
   }[state.view]();
   $('#view').innerHTML = html;
+  if (state.view === 'plans' && state.plansTab === 'sim') bindSimForm();
   if (state.view === 'transactions') {
     const s = $('#tx-search');
     if (s) s.oninput = () => { state.txSearch = s.value; renderTxList(); };
@@ -192,7 +200,7 @@ function viewDashboard() {
       <button class="btn primary" data-action="quick-add">Dalej</button></div></section>`,
 
     networth: () => {
-      const w = netWorth(state.data.accounts, txs);
+      const w = valuedNetWorth(state.data.accounts, txs, valOpts());
       return `<section class="card" ${lp('networth')}>
         <h2>Majątek netto <a href="#wealth">Konta ›</a></h2>
         <div class="stat-row">
@@ -218,6 +226,8 @@ function viewDashboard() {
       </section>`;
     },
 
+    metals: () => metalPricesCard(true),
+
     purchases: () => {
       const prio = { high: 0, mid: 1, low: 2 };
       const list = state.data.purchases.filter((p) => p.status !== 'bought').sort((a, b) => (prio[a.priority] ?? 1) - (prio[b.priority] ?? 1)).slice(0, 3);
@@ -233,7 +243,7 @@ function viewDashboard() {
     savings: () => {
       const list = state.data.accounts.filter((a) => !a.archived && accountGroup(a) === 'savings' && a.currency === 'PLN');
       let total = 0; let inflow = 0; let outflow = 0;
-      for (const a of list) { const m = accountMonth(a, txs, state.month); total += m.after; inflow += m.inflow; outflow += m.outflow; }
+      for (const a of list) { const m = accountMonth(a, txs, state.month); total += accountValue(a, txs, valOpts(lastDay(state.month))); inflow += m.inflow; outflow += m.outflow; }
       return `<section class="card" ${lp('savings')}><h2>Oszczędności i inwestycje <a href="#wealth">Majątek ›</a></h2>
         <div class="stat-row">
           <div class="stat"><small>Razem</small><b>${money(total)}</b></div>
@@ -614,8 +624,9 @@ function viewWealth() {
   const ym = state.month;
   const txs = liveTx();
   const txsUntil = txs.filter((t) => t.date < monthEnd(ym));
-  const bal = balances(state.data.accounts, txsUntil);
-  const w = netWorth(state.data.accounts, txsUntil);
+  const w = valuedNetWorth(state.data.accounts, txs, valOpts(lastDay(ym)));
+  const bookBal = balances(state.data.accounts, txsUntil);
+  const bal = new Proxy({}, { get: (_, id) => w.values[id] ?? bookBal[id] });
   const active = state.data.accounts.filter((a) => !a.archived);
   const current = active.filter((a) => accountGroup(a) === 'current');
   const savings = active.filter((a) => accountGroup(a) === 'savings');
@@ -626,16 +637,22 @@ function viewWealth() {
 
   const savingsCards = savings.map((a) => {
     const m = accountMonth(a, txs, ym);
+    const r = investmentResult(a, txs, valOpts(lastDay(ym)));
+    const metal = metalOf(a);
+    const showGain = metal || (a.valuations || []).length > 0;
     return `<section class="acard" data-lp="acc:${esc(a.id)}">
       <button class="acard-head" data-action="account-detail" data-id="${esc(a.id)}">
         <span class="ico">${ico(accountIcon(a), a.image)}</span>
         <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</span></span>
-        <span class="amt num">${esc(formatMoney(m.after, a.currency))}</span>
+        <span class="amt num">${esc(formatMoney(r.value, a.currency))}</span>
       </button>
+      ${metal ? `<div class="acard-month small">${metalLine(a)}</div>` : ''}
+      ${showGain ? `<div class="acard-month small">Wpłacono <span class="num">${esc(formatMoney(r.paidIn, a.currency))}</span> · ${r.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${r.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(r.gain, a.currency, { sign: true }))}${r.gainPct != null ? ` (${esc(fmtPct(r.gainPct * 100))})` : ''}</b></div>` : ''}
       <div class="acard-month small">${m.inflow || m.outflow ? `W tym miesiącu:${m.inflow ? ` <span class="pos num">wpłaty +${esc(formatMoney(m.inflow, a.currency))}</span>` : ''}${m.inflow && m.outflow ? ' ·' : ''}${m.outflow ? ` <span class="neg num">wypłaty −${esc(formatMoney(m.outflow, a.currency))}</span>` : ''}` : 'Brak wpłat i wypłat w tym miesiącu'}</div>
-      <div class="acard-actions">
-        <button class="btn" data-action="move" data-mode="in" data-id="${esc(a.id)}">+ Wpłata</button>
-        <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">− Wypłata</button>
+      <div class="acard-actions ${metal ? '' : 'three'}">
+        <button class="btn" data-action="move" data-mode="in" data-id="${esc(a.id)}">${metal ? '+ Kupno' : '+ Wpłata'}</button>
+        <button class="btn" data-action="move" data-mode="out" data-id="${esc(a.id)}">${metal ? '− Sprzedaż' : '− Wypłata'}</button>
+        ${metal ? '' : `<button class="btn" data-action="valuate" data-id="${esc(a.id)}">📈 Wartość</button>`}
       </div>
     </section>`;
   }).join('');
@@ -673,6 +690,7 @@ function viewWealth() {
     <div class="sec-head"><h2>Oszczędności i inwestycje</h2><b class="num">${esc(formatMoney(sumPLN(savings, (a) => bal[a.id])))}</b></div>
     ${savingsCards || '<p class="muted small">Dodaj lokatę, IKE, PPK, ETF albo cokolwiek, gdzie odkładasz pieniądze.</p>'}
     <button class="btn block" data-action="add-account" data-group="savings">+ Dodaj oszczędności / inwestycję</button>
+    ${hasMetals() ? metalPricesCard() : ''}
 
     <div class="sec-head"><h2>Kredyty</h2><b class="num">${loans.length ? esc(formatMoney(sumPLN(loans, (a) => -bal[a.id]))) : ''}</b></div>
     ${loanCards ? `<p class="small muted" style="margin:0 4px 8px">Stan w miesiącu: ${monthWord}</p>${loanCards}` : '<p class="muted small">Brak kredytów.</p>'}
@@ -702,12 +720,20 @@ function openAccountSheet(id, group) {
       `<button type="button" class="chip" data-kind="${k}" aria-pressed="${k === subtype}">${v.icon} ${esc(v.label)}</button>`).join('')}</div></div>
       <label class="field"><span>Nazwa</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. IKE w XTB, Lokata mBank"></label>
       <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. na emeryturę, ETF na MSCI World"></label>
-      <div class="grid2"><label class="field"><span>${a ? 'Kwota początkowa' : 'Ile jest tam teraz'}</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
+      <div id="a-metal" ${metalOf({ subtype }) ? '' : 'hidden'}>
+        <div class="grid2"><label class="field"><span>Ilość</span><input id="a-grams" inputmode="decimal" placeholder="np. 31,1" value="${a?.grams != null ? esc(String(Math.round(a.grams * 1000) / 1000).replace('.', ',')) : ''}"></label>
+          <label class="field"><span>Jednostka</span><select id="a-unit"><option value="g">gramy</option><option value="oz">uncje (31,1 g)</option></select></label></div>
+        <div class="grid2"><label class="field"><span>Próba</span><select id="a-purity">${PURITIES.map(([v, l]) => `<option value="${v}" ${(a?.purity || 0.9999) === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select></label>
+          <label class="field"><span>Cena skupu − % (opcj.)</span><input id="a-spread" inputmode="decimal" placeholder="np. 3" value="${a?.spread ? esc(String(a.spread).replace('.', ',')) : ''}"></label></div>
+        <p class="small muted">Wartość liczy się sama: złoto wg ceny NBP, srebro wg gold-api.com (przeliczone kursem USD z NBP).</p>
+      </div>
+      <div class="grid2"><label class="field"><span id="a-open-label">${a ? 'Kwota początkowa' : 'Ile jest tam teraz'}</span><input id="a-open" inputmode="decimal" value="${a ? esc(minorToInput(a.openingBalance)) : ''}" placeholder="0,00"></label>${curSelect}</div>
       <p class="small muted">Kolejne wpłaty i wypłaty dodajesz przyciskami na karcie.</p>`;
   } else if (group === 'loan') {
     body = `<label class="field"><span>Nazwa kredytu</span><input id="a-name" maxlength="60" value="${esc(a?.name || '')}" placeholder="np. Hipoteka PKO, Kredyt na auto"></label>
       <label class="field"><span>Opis (opcjonalnie)</span><input id="a-desc" maxlength="120" value="${esc(a?.description || '')}" placeholder="np. do 2045, oprocentowanie zmienne"></label>
       <label class="field"><span>${a ? 'Do spłaty na start (zanim zacząłeś zapisywać spłaty)' : 'Ile zostało do spłaty teraz'}</span><input id="a-open" class="amount-input" inputmode="decimal" value="${a ? esc(minorToInput(-a.openingBalance)) : ''}" placeholder="0,00"></label>
+      <label class="field"><span>Oprocentowanie % rocznie (opcj. — do symulacji)</span><input id="a-rate" inputmode="decimal" placeholder="np. 7,5" value="${a?.loanRate != null ? esc(String(a.loanRate).replace('.', ',')) : ''}"></label>
       <div class="grid2">
         <label class="field"><span>Rata miesięczna (opcj.)</span><input id="a-inst" inputmode="decimal" value="${a?.installment ? esc(minorToInput(a.installment)) : ''}" placeholder="0,00"></label>
         <label class="field"><span>Kwota kredytu (opcj.)</span><input id="a-orig" inputmode="decimal" value="${a?.loanOriginal ? esc(minorToInput(a.loanOriginal)) : ''}" placeholder="do paska postępu"></label>
@@ -725,6 +751,13 @@ function openAccountSheet(id, group) {
     <div class="err" id="a-err" role="alert"></div>
     <div class="actions"><button class="btn primary block" id="a-save">Zapisz</button></div>`);
   const pick = mountImagePicker(a?.image);
+  const paintMetal = () => {
+    const box = $('#a-metal');
+    if (!box) return;
+    const metal = !!metalOf({ subtype });
+    box.hidden = !metal;
+    $('#a-open-label').textContent = metal ? 'Ile za to zapłaciłeś (wpłacony kapitał)' : (a ? 'Kwota początkowa' : 'Ile jest tam teraz');
+  };
   const kinds = $('#a-kind');
   if (kinds) {
     kinds.onclick = (e) => {
@@ -732,6 +765,7 @@ function openAccountSheet(id, group) {
       if (!b) return;
       subtype = b.dataset.kind;
       kinds.querySelectorAll('[data-kind]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      paintMetal();
     };
   }
   $('#a-save').onclick = async () => {
@@ -751,6 +785,15 @@ function openAccountSheet(id, group) {
       item.type = SAVINGS_KINDS[subtype].type;
       item.subtype = subtype;
       item.description = $('#a-desc').value.trim();
+      if (metalOf(item)) {
+        const g = Number(($('#a-grams').value || '0').replace(/\s/g, '').replace(',', '.'));
+        const spread = Number(($('#a-spread').value || '0').replace(',', '.'));
+        if (!Number.isFinite(g) || g < 0) return err('Nieprawidłowa ilość.');
+        if (!Number.isFinite(spread) || spread < 0 || spread > 50) return err('Cena skupu: od 0 do 50%.');
+        item.grams = Math.round(($('#a-unit').value === 'oz' ? g * TROY_OUNCE_G : g) * 10000) / 10000;
+        item.purity = Number($('#a-purity').value);
+        item.spread = spread;
+      }
     } else if (group === 'loan') {
       const inst = opt('#a-inst');
       const orig = opt('#a-orig');
@@ -758,6 +801,9 @@ function openAccountSheet(id, group) {
       opening = -opening; // dług zapisujemy jako saldo ujemne
       item.type = 'loan';
       item.description = $('#a-desc').value.trim();
+      const rateRaw = $('#a-rate').value.trim().replace(',', '.');
+      if (rateRaw && !(Number(rateRaw) >= 0 && Number(rateRaw) <= 50)) return err('Oprocentowanie od 0 do 50%.');
+      item.loanRate = rateRaw ? Number(rateRaw) : null;
       item.installment = inst || null;
       item.loanOriginal = orig || null;
     } else {
@@ -769,6 +815,7 @@ function openAccountSheet(id, group) {
     closeSheet();
     await reload();
     toast('Zapisano');
+    if (metalOf(item)) refreshMetalPrices({ force: !state.prices?.[metalOf(item)] });
   };
 }
 
@@ -779,15 +826,21 @@ function openAccountDetail(id) {
   const cats = catById();
   const accs = accById();
   const txs = liveTx().filter((t) => t.accountId === id || t.toAccountId === id).sort(byDateDesc);
-  const bal = balances([a], liveTx())[id];
+  const bookNow = balances([a], liveTx())[id];
   const isLoan = a.type === 'loan';
+  const inv = accountGroup(a) === 'savings' ? investmentResult(a, liveTx(), valOpts()) : null;
+  const bal = inv ? inv.value : bookNow;
   openSheet(a.name, `
     <p class="muted small" style="margin-top:0">${esc(accountKindLabel(a))}${a.description ? ' · ' + esc(a.description) : ''}</p>
     <div class="stat-row" style="grid-template-columns:1fr 1fr">
-      <div class="stat"><small>${isLoan ? 'Do spłaty' : 'Saldo'}</small><b class="num">${esc(formatMoney(isLoan ? -bal : bal, a.currency))}</b></div>
-      <div class="stat"><small>${isLoan ? 'Na start' : 'Saldo początkowe'}</small><b class="num">${esc(formatMoney(isLoan ? -a.openingBalance : a.openingBalance, a.currency))}</b></div>
+      <div class="stat"><small>${isLoan ? 'Do spłaty' : inv ? 'Wartość' : 'Saldo'}</small><b class="num">${esc(formatMoney(isLoan ? -bal : bal, a.currency))}</b></div>
+      <div class="stat"><small>${isLoan ? 'Na start' : inv ? 'Wpłacono na start' : 'Saldo początkowe'}</small><b class="num">${esc(formatMoney(isLoan ? -a.openingBalance : a.openingBalance, a.currency))}</b></div>
     </div>
-    <h3 class="small muted" style="margin:16px 4px 6px">Historia</h3>
+    ${inv && (metalOf(a) || (a.valuations || []).length) ? `<p class="small" style="margin:10px 4px 0">Wpłacono <span class="num">${esc(formatMoney(inv.paidIn, a.currency))}</span> · ${inv.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${inv.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(inv.gain, a.currency, { sign: true }))}${inv.gainPct != null ? ` (${esc(fmtPct(inv.gainPct * 100))})` : ''}</b></p>` : ''}
+    ${metalOf(a) ? `<p class="small muted" style="margin:6px 4px 0">${metalLine(a)}</p>` : ''}
+    ${inv ? valuationHistoryHtml(a) : ''}
+    ${inv && !metalOf(a) ? `<div class="actions"><button class="btn primary block" data-action="valuate" data-id="${esc(id)}">📈 Aktualizuj wartość</button></div>` : ''}
+    <h3 class="small muted" style="margin:16px 4px 6px">Wpłaty i wypłaty</h3>
     ${txs.length ? `<div class="list">${txs.map((t) => {
       const e = effectOnAccount(t, id);
       const other = t.type === 'transfer' ? (t.accountId === id ? accs[t.toAccountId]?.name : accs[t.accountId]?.name) || 'tylko zapis' : catLabel(t.categoryId, cats);
@@ -807,13 +860,16 @@ async function openMoveSheet(id, mode) {
   // „tylko zapis” nigdy nie jest zapamiętywane — domyślnie zawsze prawdziwe konto
   const def = (sources.find((x) => x.id === last) || sources.find((x) => x.type === 'checking') || sources[0])?.id || '';
   const date = isCurrentMonth() ? todayISO() : `${state.month}-01`;
-  const titles = { in: `Wpłata: ${a.name}`, out: `Wypłata: ${a.name}`, pay: `Spłata: ${a.name}` };
-  const defDesc = { in: 'Wpłata', out: 'Wypłata', pay: 'Spłata kredytu' }[mode];
+  const metal = metalOf(a);
+  const titles = metal ? { in: `Kupno: ${a.name}`, out: `Sprzedaż: ${a.name}` } : { in: `Wpłata: ${a.name}`, out: `Wypłata: ${a.name}`, pay: `Spłata: ${a.name}` };
+  const defDesc = metal ? { in: 'Kupno', out: 'Sprzedaż' }[mode] : { in: 'Wpłata', out: 'Wypłata', pay: 'Spłata kredytu' }[mode];
   const otherLabel = mode === 'out' ? 'Na które konto trafiają pieniądze' : 'Z którego konta';
   const none = mode === 'out' ? 'Nie dodawaj do żadnego konta (tylko zapis)' : 'Nie odejmuj z żadnego konta (tylko zapis)';
   const prefill = mode === 'pay' && a.installment ? minorToInput(a.installment) : '';
   openSheet(titles[mode], `
-    <label class="field"><span>Kwota</span><input id="mv-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(prefill)}" autocomplete="off"></label>
+    <label class="field"><span>${metal ? (mode === 'in' ? 'Ile zapłaciłeś' : 'Ile dostałeś') : 'Kwota'}</span><input id="mv-amount" class="amount-input" inputmode="decimal" placeholder="0,00" value="${esc(prefill)}" autocomplete="off"></label>
+    ${metal ? `<div class="grid2"><label class="field"><span>${mode === 'in' ? 'Ile kupiłeś' : 'Ile sprzedałeś'}</span><input id="mv-grams" inputmode="decimal" placeholder="np. 31,1"></label>
+      <label class="field"><span>Jednostka</span><select id="mv-unit"><option value="g">gramy</option><option value="oz">uncje</option></select></label></div>` : ''}
     <div class="grid2">
       <label class="field"><span>Data</span><input id="mv-date" type="date" value="${esc(date)}"></label>
       <label class="field"><span>Opis</span><input id="mv-desc" maxlength="200" value="${esc(defDesc)}"></label>
@@ -843,7 +899,17 @@ async function openMoveSheet(id, mode) {
     };
     const errors = validateTransaction(t, state.data);
     if (errors.length) { $('#mv-err').textContent = errors.join(' · '); return; }
+    let grams = 0;
+    if (metal) {
+      grams = Number(($('#mv-grams').value || '0').replace(/\s/g, '').replace(',', '.'));
+      if (!Number.isFinite(grams) || grams < 0) { $('#mv-err').textContent = 'Nieprawidłowa ilość.'; return; }
+      if ($('#mv-unit').value === 'oz') grams *= TROY_OUNCE_G;
+    }
     await db.put('transactions', t);
+    if (metal && grams) {
+      const g = Math.max(0, Math.round(((Number(a.grams) || 0) + (mode === 'out' ? -grams : grams)) * 10000) / 10000);
+      await db.put('accounts', { ...a, grams: g });
+    }
     if (other) await db.setSetting('lastMoveAccount', other);
     closeSheet();
     if (monthKey(t.date) !== state.month) state.month = monthKey(t.date);
@@ -1000,13 +1066,15 @@ const ai = { history: [], busy: false, error: '' };
 function viewPlans() {
   const tab = state.plansTab || 'buy';
   const t = (id, label) => `<button type="button" data-action="plans-tab" data-tab2="${id}" aria-pressed="${tab === id}">${label}</button>`;
-  const body = tab === 'analysis' ? viewAnalytics() : tab === 'ai' ? viewAI() : viewPurchases();
-  return `<div class="seg plans-seg">${t('buy', '🛒 Do kupienia')}${t('analysis', '📊 Analiza')}${t('ai', '✨ AI')}</div>${body}`;
+  const body = tab === 'analysis' ? viewAnalytics() : tab === 'ai' ? viewAI() : tab === 'sim' ? viewSim() : viewPurchases();
+  return `<div class="seg plans-seg">${t('buy', '🛒 Zakupy')}${t('sim', '🔮 Symulacja')}${t('analysis', '📊 Analiza')}${t('ai', '✨ AI')}</div>${body}`;
 }
 
 function purchaseContext(p) {
   const txs = liveTx();
-  const bal = balances(state.data.accounts, txs);
+  const vals = valuedNetWorth(state.data.accounts, txs, valOpts()).values;
+  const bookB = balances(state.data.accounts, txs);
+  const bal = new Proxy({}, { get: (_, id) => vals[id] ?? bookB[id] });
   const savings = state.data.accounts.filter((a) => !a.archived && accountGroup(a) === 'savings' && a.currency === 'PLN');
   const avg = averages(txs, addMonths(monthKey(todayISO()), -1), 3);
   const linked = p.accountId ? state.data.accounts.find((a) => a.id === p.accountId) : null;
@@ -1232,7 +1300,8 @@ const aiModel = () => getPref('sf-gemini-model', '') || DEFAULT_MODEL;
 function currentAIContext() {
   const analysis = {};
   for (const p of state.data.purchases) analysis[p.id] = analyzePurchase(p, purchaseContext(p));
-  return buildAIContext(state.data, state.month, { purchases: state.data.purchases, purchaseAnalysis: analysis });
+  const w = valuedNetWorth(state.data.accounts, liveTx(), valOpts());
+  return buildAIContext(state.data, state.month, { purchases: state.data.purchases, purchaseAnalysis: analysis, values: w.values, netWorth: w });
 }
 
 function viewAI() {
@@ -1359,6 +1428,339 @@ function mountImagePicker(initial) {
     }
   };
   return { get: () => current };
+}
+
+// ---------- Wyceny, metale, wykresy ----------
+const valOpts = (asOf) => ({ prices: state.prices, today: todayISO(), ...(asOf ? { asOf } : {}) });
+const lastDay = (ym) => dateInMonth(ym, 31);
+const fmtGrams = (g) => `${(Math.round((Number(g) || 0) * 100) / 100).toLocaleString('pl-PL')} g`;
+const fmtPct = (p) => `${p >= 0 ? '+' : ''}${p.toFixed(2).replace('.', ',')}%`;
+const PURITIES = [
+  [0.9999, '999,9 (sztabki, monety bulionowe)'], [0.999, '999'], [0.9167, '916,7 (22 karaty, np. Krugerrand)'],
+  [0.925, '925 (srebro próby 925)'], [0.9, '900 (stare monety)'], [0.8, '800'], [0.75, '750 (18 karatów)'], [0.585, '585 (14 karatów)'],
+];
+
+function metalLine(a) {
+  const metal = metalOf(a);
+  const p = state.prices?.[metal];
+  const head = `${fmtGrams(a.grams)} · próba ${String(Math.round((a.purity || 1) * 10000) / 10).replace('.', ',')}${a.spread ? ` · skup −${String(a.spread).replace('.', ',')}%` : ''}`;
+  return p?.pln ? `${head} · <span class="num">${esc(formatMoney(Math.round(p.pln * 100)))}</span>/g <span class="muted">(${esc(p.source)}, ${esc(formatDatePL(p.date))})</span>`
+    : `${head} · <span class="neg">brak ceny — odśwież ceny</span>`;
+}
+
+/** Prosty wykres liniowy (SVG). series: [{ values, color, dash, label }], labels: podpisy osi X. */
+function lineChart(series, labels, { height = 170, fromZero = true, fmt = (v) => formatMoney(v).replace(/,00/, '') } = {}) {
+  const W = 340; const H = height; const padL = 4; const padB = 20; const top = 18;
+  const all = series.flatMap((s) => s.values).filter((v) => Number.isFinite(v));
+  if (!all.length) return '<p class="small muted">Brak danych do wykresu.</p>';
+  let min = fromZero ? Math.min(0, ...all) : Math.min(...all);
+  let max = Math.max(...all);
+  if (!fromZero) { const pad = (max - min) * 0.08 || Math.abs(max) * 0.02 || 1; min -= pad; max += pad; }
+  if (max === min) max = min + 1;
+  const n = Math.max(...series.map((s) => s.values.length));
+  const x = (i) => padL + ((W - padL * 2) * i) / Math.max(1, n - 1);
+  const y = (v) => top + (H - padB - top) * (1 - (v - min) / (max - min));
+  const paths = series.map((s) => {
+    const d = s.values.map((v, i) => (Number.isFinite(v) ? `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}` : '')).join('');
+    return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" ${s.dash ? 'stroke-dasharray="5 4"' : ''} stroke-linejoin="round" stroke-linecap="round"/>`;
+  }).join('');
+  const step = Math.ceil(n / 6);
+  const xl = labels.map((l, i) => (i % step === 0 || i === n - 1 ? `<text x="${x(i)}" y="${H - 5}" text-anchor="${i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'}">${esc(l)}</text>` : '')).join('');
+  const zero = fromZero && min < 0 ? `<line x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" stroke="var(--line)"/>` : '';
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Wykres">
+    <line x1="0" x2="${W}" y1="${H - padB}" y2="${H - padB}" stroke="var(--line)"/>${zero}
+    <text x="2" y="${top - 5}">${esc(fmt(max))}</text>${min < 0 || !fromZero ? `<text x="2" y="${H - padB - 4}">${esc(fmt(min))}</text>` : ''}
+    ${paths}${xl}</svg>`;
+}
+
+function metalPricesCard(compact = false) {
+  const p = state.prices || {};
+  const row = (k, label) => `<div class="stat"><small>${label} · zł/g</small><b>${p[k]?.pln ? `<span class="num">${esc(formatMoney(Math.round(p[k].pln * 100)))}</span>` : '—'}</b>
+    <small>${p[k]?.date ? esc(formatDatePL(p[k].date)) + ' · ' + esc(p[k].source) : 'brak danych'}</small></div>`;
+  const metal = state.metalChart || 'gold';
+  const hist = (p.history?.[metal] || []).slice(-365);
+  const chart = hist.length > 1
+    ? lineChart([{ values: hist.map((h) => Math.round(h.pln * 100)), color: metal === 'gold' ? '#c9a227' : '#8f9aa6' }], hist.map((h) => formatDatePL(h.date).slice(0, 5)), { height: 140, fromZero: false })
+    : `<p class="small muted">${metal === 'silver' ? 'Historia srebra zbiera się od dziś — aplikacja zapisuje cenę raz dziennie.' : 'Brak historii — odśwież ceny.'}</p>`;
+  return `<section class="card chart" ${compact ? 'data-lp="card:metals"' : ''}><h2>Ceny złota i srebra <button class="link" data-action="refresh-prices">Odśwież</button></h2>
+    <div class="stat-row" style="grid-template-columns:1fr 1fr">${row('gold', 'Złoto')}${row('silver', 'Srebro')}</div>
+    <div class="chips" style="margin-top:10px"><button class="chip" data-action="metal-chart" data-m="gold" aria-pressed="${metal === 'gold'}">Złoto</button><button class="chip" data-action="metal-chart" data-m="silver" aria-pressed="${metal === 'silver'}">Srebro</button></div>
+    ${chart}
+    ${state.priceProblems?.length ? `<p class="small neg">Nie udało się pobrać: ${esc(state.priceProblems.join('; '))}. Pokazuję ostatnie znane ceny.</p>` : ''}
+    <p class="small muted">Złoto: NBP (1 g próby 1000). Srebro: gold-api.com przeliczone kursem USD z NBP. Aplikacja tylko pobiera ceny — nic nie wysyła.</p>
+  </section>`;
+}
+
+const hasMetals = () => state.data.accounts.some((a) => !a.archived && metalOf(a));
+
+async function refreshMetalPrices({ force = false, silent = true } = {}) {
+  if (state.pricesBusy) return;
+  const age = state.prices?.updatedAt ? Date.now() - new Date(state.prices.updatedAt).getTime() : Infinity;
+  if (!force && age < 3 * 3600e3) return;
+  if (!navigator.onLine) { if (!silent) toast('Brak internetu — pokazuję ostatnie znane ceny'); return; }
+  state.pricesBusy = true;
+  try {
+    const { prices, problems } = await refreshPrices(state.prices || {}, { withHistory: state.prices?.goldHistoryAt !== todayISO() });
+    state.prices = prices;
+    state.priceProblems = problems;
+    await db.setSetting('metalPrices', prices);
+    if (!$('#sheet').open || !silent) render();
+    if (!silent) toast(problems.length ? 'Część cen nie została pobrana' : 'Zaktualizowano ceny metali');
+  } finally {
+    state.pricesBusy = false;
+  }
+}
+
+function openValuationSheet(id) {
+  const a = accById()[id];
+  if (!a) return;
+  const txs = liveTx();
+  const today = todayISO();
+  let mode = 'amount';
+  openSheet(`Wartość: ${a.name}`, `
+    <p class="small" id="va-base"></p>
+    <div class="seg" id="va-mode"><button type="button" data-m="amount" aria-pressed="true">Nowa kwota</button><button type="button" data-m="percent" aria-pressed="false">Zmiana o %</button></div>
+    <label class="field"><span id="va-label">Aktualna wartość (zł)</span><input id="va-input" class="amount-input" inputmode="decimal" autocomplete="off" placeholder="0,00"></label>
+    <label class="field"><span>Data wyceny</span><input id="va-date" type="date" value="${today}" max="${today}"></label>
+    <div class="note" id="va-preview">Wpisz nową wartość albo zmianę w %.</div>
+    <div class="err" id="va-err" role="alert"></div>
+    <div class="actions"><button class="btn primary block" id="va-save">Zapisz wycenę</button></div>
+    <p class="small muted">Wycena zmienia wartość majątku, ale nie jest przychodem i nie wpływa na bilans miesiąca. Dopłaty i wypłaty dodawaj przyciskami Wpłata / Wypłata — wtedy nie pomylą się z zyskiem.</p>`);
+  const base = () => accountValue(a, txs, valOpts($('#va-date').value || today));
+  const parse = () => {
+    const raw = $('#va-input').value.trim();
+    if (!raw) return null;
+    if (mode === 'percent') {
+      const v = Number(raw.replace(/\s/g, '').replace('%', '').replace(',', '.'));
+      return applyChange(base(), 'percent', v);
+    }
+    return applyChange(base(), 'amount', toMinor(raw));
+  };
+  const paint = () => {
+    const b = base();
+    $('#va-base').innerHTML = `Wartość na ${esc(formatDatePL($('#va-date').value || today))}: <b class="num">${esc(formatMoney(b, a.currency))}</b> · wpłacono <span class="num">${esc(formatMoney(bookBalance(a, txs, $('#va-date').value || today), a.currency))}</span>`;
+    const r = parse();
+    $('#va-preview').innerHTML = r ? `<b class="num">${esc(formatMoney(b, a.currency))}</b> → <b class="num">${esc(formatMoney(r.value, a.currency))}</b><br>
+      <span class="${r.diff >= 0 ? 'pos' : 'neg'} num">${esc(formatMoney(r.diff, a.currency, { sign: true }))}${r.pct != null ? ` (${esc(fmtPct(r.pct))})` : ''}</span>`
+      : 'Wpisz nową wartość albo zmianę w %.';
+  };
+  paint();
+  $('#va-mode').onclick = (e) => {
+    const x = e.target.closest('[data-m]');
+    if (!x) return;
+    mode = x.dataset.m;
+    $('#va-mode').querySelectorAll('[data-m]').forEach((y) => y.setAttribute('aria-pressed', String(y === x)));
+    $('#va-label').textContent = mode === 'percent' ? 'Zmiana wartości w % (np. 7 albo -3,5)' : 'Aktualna wartość (zł)';
+    $('#va-input').value = '';
+    paint();
+    $('#va-input').focus();
+  };
+  $('#va-input').oninput = paint;
+  $('#va-date').onchange = paint;
+  focusLater('#va-input');
+  $('#va-save').onclick = async () => {
+    const r = parse();
+    const date = $('#va-date').value;
+    if (!r || !Number.isInteger(r.value) || r.value < 0) { $('#va-err').textContent = 'Wpisz poprawną kwotę albo procent (wartość nie może być ujemna).'; return; }
+    if (!date || date > today) { $('#va-err').textContent = 'Wybierz datę nie późniejszą niż dziś.'; return; }
+    const valuations = sortedValuations(a).filter((v) => v.date !== date);
+    valuations.push({ date, value: r.value, book: bookBalance(a, txs, date), at: new Date().toISOString() });
+    await db.put('accounts', { ...a, valuations });
+    closeSheet();
+    await reload();
+    toast(`Zapisano wycenę: ${formatMoney(r.value, a.currency)}`);
+  };
+}
+
+/** Wykres i lista wycen w szczegółach konta. */
+function valuationHistoryHtml(a) {
+  const txs = liveTx();
+  const metal = metalOf(a);
+  if (metal) {
+    const hist = (state.prices?.history?.[metal] || []).slice(-365);
+    if (hist.length < 2) return '';
+    const vals = hist.map((h) => metalValue(a, h.pln));
+    return `<h3 class="copy-h">Wartość Twojego ${metal === 'gold' ? 'złota' : 'srebra'} (wg obecnej ilości)</h3>
+      <div class="chart">${lineChart([{ values: vals, color: 'var(--accent)' }], hist.map((h) => formatDatePL(h.date).slice(0, 5)), { height: 140, fromZero: false })}</div>`;
+  }
+  const list = sortedValuations(a);
+  if (!list.length) return '';
+  const pts = list.map((v) => ({ label: formatDatePL(v.date).slice(0, 5), value: v.value, paid: bookBalance(a, txs, v.date) }));
+  const now = investmentResult(a, txs, valOpts());
+  pts.push({ label: 'dziś', value: now.value, paid: now.paidIn });
+  return `<h3 class="copy-h">Historia wycen</h3>
+    <div class="chart">${lineChart([{ values: pts.map((p) => p.value), color: 'var(--accent)' }, { values: pts.map((p) => p.paid), color: 'var(--muted)', dash: true }], pts.map((p) => p.label), { height: 140 })}
+    <div class="legend"><span><i style="background:var(--accent)"></i>Wartość</span><span><i style="background:var(--muted)"></i>Wpłacono</span></div></div>
+    <ul class="menu kv">${list.slice().reverse().map((v) => `<li><div><span>${esc(formatDatePL(v.date))}</span><span><b class="num">${esc(formatMoney(v.value, a.currency))}</b>
+      <button class="link neg" data-action="del-valuation" data-id="${esc(a.id)}" data-date="${esc(v.date)}" aria-label="Usuń wycenę">✕</button></span></div></li>`).join('')}</ul>`;
+}
+
+// ---------- Symulacja ----------
+function simSettings() {
+  const s = { ...DEFAULT_SIM, ...(state.simSettings || {}) };
+  s.il = { ...DEFAULT_SIM.il, ...(state.simSettings?.il || {}) };
+  return s;
+}
+
+function simStart() {
+  const txs = liveTx();
+  const w = valuedNetWorth(state.data.accounts, txs, valOpts());
+  const start = { cash: 0, safe: 0, market: 0, retire: 0, metal: 0 };
+  const loans = [];
+  const s = simSettings();
+  let estimated = false;
+  for (const a of state.data.accounts) {
+    if (a.archived || a.currency !== 'PLN') continue;
+    const v = w.values[a.id] ?? 0;
+    const b = bucketOf(a);
+    if (b === 'debt') {
+      if (v < 0) {
+        const rate = a.loanRate != null ? a.loanRate : s.loanRateDefault;
+        let installment = a.installment || 0;
+        if (!installment) { installment = loanInstallment(-v, rate, 120); estimated = true; }
+        loans.push({ name: a.name, balance: -v, rate, installment, rateAssumed: a.loanRate == null });
+      }
+    } else start[b] += v;
+  }
+  const avg = averages(txs, addMonths(monthKey(todayISO()), -1), 3);
+  return { start, loans, avg, net: w.net, estimated };
+}
+
+function runSim(s, st, delta = 0) {
+  const monthly = s.monthly != null ? Math.round(s.monthly * 100) : Math.max(0, st.avg.net);
+  const rates = { safe: s.rSafe + delta, market: s.rMarket + delta, retire: s.rRetire + delta, metal: s.rMetal + delta };
+  return simulate({
+    start: st.start, loans: st.loans, monthly, years: s.years, rates, inflation: s.inflation, belka: s.belka,
+    overpay: Math.round((s.overpay || 0) * 100), alloc: { safe: s.allocSafe, market: s.allocMarket, retire: s.allocRetire },
+    investLoan: s.il.on ? { amount: Math.round(s.il.amount * 100), rate: s.il.rate, months: s.il.months, target: s.il.target } : null,
+  });
+}
+
+function viewSim() {
+  const s = simSettings();
+  const st = simStart();
+  const num = (id, label, v, step = '0.1', extra = '') => `<label class="field"><span>${label}</span><input data-sim="${id}" type="number" inputmode="decimal" step="${step}" value="${v ?? ''}" ${extra}></label>`;
+  const z = (g) => esc(formatMoney(g));
+  return `<section class="card"><h2>📌 Punkt startowy — dane rzeczywiste</h2>
+      <ul class="menu kv">
+        <li><div><span>Majątek netto dziś</span><span><b class="num">${z(st.net)}</b></span></div></li>
+        <li><div><span>Konta bieżące</span><span class="num">${z(st.start.cash)}</span></div></li>
+        <li><div><span>Lokaty, obligacje, oszczędności</span><span class="num">${z(st.start.safe)}</span></div></li>
+        <li><div><span>ETF, fundusze, akcje, krypto</span><span class="num">${z(st.start.market)}</span></div></li>
+        <li><div><span>IKE, IKZE, PPK</span><span class="num">${z(st.start.retire)}</span></div></li>
+        <li><div><span>Złoto i srebro</span><span class="num">${z(st.start.metal)}</span></div></li>
+        ${st.loans.map((l) => `<li><div><span>Kredyt: ${esc(l.name)}${l.rateAssumed ? ' <small class="muted">(oprocentowanie założone)</small>' : ''}</span><span class="num neg">−${z(l.balance)}</span></div></li>`).join('')}
+        <li><div><span>Średnia nadwyżka (${st.avg.months} mies.)</span><span class="num">${st.avg.months ? z(st.avg.net) : 'brak danych'}</span></div></li>
+      </ul>
+      ${st.estimated ? '<p class="small muted">Dla kredytu bez wpisanej raty przyjęto ratę na 10 lat. Wpisz ratę i oprocentowanie w Majątek → kredyt → Edytuj.</p>' : ''}
+    </section>
+    <section class="card" id="sim-form"><h2>⚙️ Założenia</h2>
+      <label class="field"><span>Horyzont: <b id="sim-years-out">${s.years} lat</b></span><input data-sim="years" type="range" min="1" max="30" step="1" value="${s.years}"></label>
+      ${num('monthly', `Odkładam miesięcznie, zł (puste = średnia: ${st.avg.months ? z(Math.max(0, st.avg.net)) : '0 zł'})`, s.monthly, '50', 'placeholder="średnia z danych"')}
+      <p class="small muted" style="margin:4px 0 0">Z tej kwoty opłacane są raty kredytów, reszta trafia do oszczędności i inwestycji.</p>
+      <div class="grid2">${num('rSafe', 'Lokaty/obligacje %', s.rSafe)}${num('rMarket', 'ETF/akcje %', s.rMarket)}</div>
+      <div class="grid2">${num('rRetire', 'IKE/IKZE/PPK %', s.rRetire)}${num('rMetal', 'Złoto/srebro %', s.rMetal)}</div>
+      <div class="grid2">${num('inflation', 'Inflacja % rocznie', s.inflation)}${num('overpay', 'Nadpłata kredytów zł/mies.', s.overpay, '50')}</div>
+      <label class="check"><input type="checkbox" data-sim="belka" ${s.belka ? 'checked' : ''}> Podatek Belki 19% (bez IKE/IKZE/PPK i metali)</label>
+      <div class="field"><span>Gdzie trafia nadwyżka (%)</span><div class="grid3">
+        ${num('allocSafe', 'Lokaty', s.allocSafe, '5')}${num('allocMarket', 'ETF', s.allocMarket, '5')}${num('allocRetire', 'IKE', s.allocRetire, '5')}</div></div>
+      <details class="more" ${s.il.on ? 'open' : ''}><summary>Kredyt inwestycyjny (symulacja)</summary>
+        <label class="check"><input type="checkbox" data-sim="il.on" ${s.il.on ? 'checked' : ''}> Uwzględnij kredyt inwestycyjny</label>
+        <div class="grid2">${num('il.amount', 'Kwota kredytu zł', s.il.amount, '1000')}${num('il.rate', 'Oprocentowanie %', s.il.rate)}</div>
+        <div class="grid2">${num('il.months', 'Okres (mies.)', s.il.months, '1')}${num('il.ret', 'Zakładany zysk %', s.il.ret)}</div>
+        <label class="field"><span>Gdzie inwestuję</span><select data-sim="il.target">
+          <option value="market" ${s.il.target === 'market' ? 'selected' : ''}>ETF / akcje / fundusze</option>
+          <option value="retire" ${s.il.target === 'retire' ? 'selected' : ''}>IKE / IKZE</option>
+          <option value="safe" ${s.il.target === 'safe' ? 'selected' : ''}>Lokaty / obligacje</option>
+          <option value="metal" ${s.il.target === 'metal' ? 'selected' : ''}>Złoto / srebro</option></select></label>
+      </details>
+      <button class="btn block" data-action="sim-reset" style="margin-top:10px">Przywróć domyślne założenia</button>
+    </section>
+    <div id="sim-results">${simResultsHtml(s, st)}</div>`;
+}
+
+function simResultsHtml(s = simSettings(), st = simStart()) {
+  const base = runSim(s, st);
+  const pess = runSim(s, st, -3);
+  const opt = runSim(s, st, 2);
+  const z = (g) => esc(formatMoney(g).replace(/,\d\d/, ''));
+  const nowYear = Number(todayISO().slice(0, 4));
+  const monthsLabel = (m) => { const y = Math.floor(m / 12); const r = m % 12; return [y ? `${y} ${y === 1 ? 'rok' : y < 5 ? 'lata' : 'lat'}` : '', r ? `${r} mies.` : ''].filter(Boolean).join(' '); };
+  const whenYm = (m) => monthNamePL(addMonths(monthKey(todayISO()), m)).toLowerCase();
+  const sum = s.allocSafe + s.allocMarket + s.allocRetire;
+  const pick = [1, 3, 5, 10, 15, 20, 25, 30].filter((y) => y <= s.years);
+  if (!pick.includes(s.years)) pick.push(s.years);
+  let il = '';
+  if (s.il.on && s.il.amount > 0 && s.il.months > 0) {
+    const a = investLoanAnalysis({ amount: Math.round(s.il.amount * 100), rate: s.il.rate, months: s.il.months, ret: s.il.ret, belka: s.belka && s.il.target !== 'retire' && s.il.target !== 'metal' });
+    const row = (label, x) => `<li><div><span>${label} (${String(x.ret).replace('.', ',')}%)</span><span class="num ${x.benefit >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(x.benefit, 'PLN', { sign: true }))}</span></div></li>`;
+    il = `<section class="card"><h2>🏦 Kredyt inwestycyjny — czy się opłaca?</h2>
+      <ul class="menu kv">
+        <li><div><span>Rata</span><span class="num"><b>${esc(formatMoney(a.installment))}</b></span></div></li>
+        <li><div><span>Odsetki łącznie</span><span class="num neg">${esc(formatMoney(a.interest))}</span></div></li>
+        <li><div><span>Inwestycja po ${s.il.months} mies. (po podatku)</span><span class="num">${esc(formatMoney(a.base.netA))}</span></div></li>
+        <li><div><span>Bez kredytu: odkładanie raty co miesiąc</span><span class="num">${esc(formatMoney(a.base.netB))}</span></div></li>
+        <li><div><span><b>Różnica na korzyść kredytu</b></span><span class="num ${a.base.benefit >= 0 ? 'pos' : 'neg'}"><b>${esc(formatMoney(a.base.benefit, 'PLN', { sign: true }))}</b></span></div></li>
+        <li><div><span>Próg opłacalności</span><span><b>${a.breakEven != null ? `${String(a.breakEven).replace('.', ',')}% rocznie` : '—'}</b></span></div></li>
+      </ul>
+      <h3 class="copy-h">Scenariusze zysku</h3>
+      <ul class="menu kv">${row('Pesymistyczny', a.pessimistic)}${row('Bazowy', a.base)}${row('Optymistyczny', a.optimistic)}</ul>
+      <p class="note warn small">Kredyt na inwestycję zwiększa ryzyko: ratę płacisz zawsze, a wartość inwestycji może spaść. Opłaca się tylko wtedy, gdy zysk po podatku przekroczy próg opłacalności. To szacunek, nie rekomendacja.</p>
+    </section>`;
+  }
+  return `<section class="card"><h2>📈 Szacunek za ${s.years} lat</h2>
+      <div class="big-result"><b class="num">${z(base.final.net)}</b><span>majątek netto w ${nowYear + s.years} r.</span></div>
+      <p class="small">W dzisiejszych pieniądzach (po inflacji ${String(s.inflation).replace('.', ',')}%): <b class="num">${z(base.final.netReal)}</b></p>
+      <div class="chart">${lineChart([
+        { values: base.series.map((p) => p.net), color: 'var(--accent)' },
+        { values: base.series.map((p) => p.netReal), color: 'var(--muted)', dash: true },
+        { values: base.series.map((p) => -p.debt), color: 'var(--expense)' },
+      ], base.series.map((p) => String(nowYear + p.month / 12 | 0)))}
+        <div class="legend"><span><i style="background:var(--accent)"></i>Netto</span><span><i style="background:var(--muted)"></i>Po inflacji</span><span><i style="background:var(--expense)"></i>Długi</span></div></div>
+      ${sum !== 100 ? `<p class="small neg">Podział nadwyżki sumuje się do ${sum}% — liczę proporcjonalnie.</p>` : ''}
+    </section>
+    <section class="card"><h2>Rok po roku</h2><ul class="menu kv">
+      ${pick.map((y) => { const p = base.series.find((q) => q.month === y * 12) || base.final; return `<li><div><span>${nowYear + y} (za ${y} ${y === 1 ? 'rok' : y < 5 ? 'lata' : 'lat'})</span><span><b class="num">${z(p.net)}</b> <small class="muted num">/ ${z(p.netReal)}</small></span></div></li>`; }).join('')}
+    </ul><p class="small muted">Druga kwota: wartość po inflacji.</p></section>
+    <section class="card"><h2>Kamienie milowe</h2><ul class="menu kv">
+      ${base.payoffs.map((l) => `<li><div><span>${esc(l.name)}</span><span>${l.month != null ? `spłacony: <b>${esc(whenYm(l.month))}</b> <small class="muted">(za ${esc(monthsLabel(l.month))})</small>` : `<span class="neg">do spłaty po ${s.years} latach: ${z(l.left)}</span>`}</span></div></li>`).join('')}
+      ${base.milestones.map((m) => `<li><div><span>Majątek netto ${z(m.amount)}</span><span><b>${esc(whenYm(m.month))}</b></span></div></li>`).join('')}
+      ${!base.payoffs.length && !base.milestones.length ? '<li><div><span class="muted">Brak kamieni milowych w tym horyzoncie.</span></div></li>' : ''}
+    </ul></section>
+    <section class="card"><h2>Scenariusze</h2><ul class="menu kv">
+      <li><div><span>Pesymistyczny (zwroty −3 pkt %)</span><span class="num">${z(pess.final.net)}</span></div></li>
+      <li><div><span><b>Bazowy</b></span><span class="num"><b>${z(base.final.net)}</b></span></div></li>
+      <li><div><span>Optymistyczny (zwroty +2 pkt %)</span><span class="num">${z(opt.final.net)}</span></div></li>
+    </ul></section>
+    ${il}
+    <button class="btn primary block" data-action="sim-ai">✨ Zapytaj AI o tę symulację</button>
+    <p class="note small">📊 To <b>szacunek</b> na Twoich założeniach, nie prognoza ani gwarancja. Uproszczenia: stałe stopy zwrotu i inflacja, podatek liczony od bieżącego zysku, raty kredytów stałe, kredyty bez wpisanego oprocentowania liczone na ${String(s.loanRateDefault).replace('.', ',')}%.</p>`;
+}
+
+let simSaveTimer = null;
+function bindSimForm() {
+  const form = $('#sim-form');
+  if (!form) return;
+  const onChange = (e) => {
+    const el = e.target.closest('[data-sim]');
+    if (!el) return;
+    const key = el.dataset.sim;
+    const cur = simSettings();
+    let v;
+    if (el.type === 'checkbox') v = el.checked;
+    else if (el.tagName === 'SELECT') v = el.value;
+    else v = el.value.trim() === '' ? null : Number(el.value.replace(',', '.'));
+    if (v !== null && typeof v === 'number' && !Number.isFinite(v)) return;
+    if (key.startsWith('il.')) cur.il = { ...cur.il, [key.slice(3)]: v ?? DEFAULT_SIM.il[key.slice(3)] };
+    else cur[key] = key === 'monthly' ? v : (v ?? DEFAULT_SIM[key]);
+    if (key === 'years') $('#sim-years-out').textContent = `${v} lat`;
+    state.simSettings = cur;
+    $('#sim-results').innerHTML = simResultsHtml(cur);
+    clearTimeout(simSaveTimer);
+    simSaveTimer = setTimeout(() => db.setSetting('simSettings', state.simSettings), 400);
+  };
+  form.oninput = onChange;
+  form.onchange = onChange;
 }
 
 // ---------- Ustawienia ----------
@@ -1558,7 +1960,8 @@ function openContextMenu(spec) {
     const g = accountGroup(a);
     title = a.name;
     head = esc(accountKindLabel(a));
-    if (g === 'savings') items.push(item('move', '➕', 'Wpłata', { close: false, extra: 'data-mode="in"' }), item('move', '➖', 'Wypłata', { close: false, extra: 'data-mode="out"' }));
+    if (g === 'savings') items.push(item('move', '➕', metalOf(a) ? 'Kupno' : 'Wpłata', { close: false, extra: 'data-mode="in"' }), item('move', '➖', metalOf(a) ? 'Sprzedaż' : 'Wypłata', { close: false, extra: 'data-mode="out"' }));
+    if (g === 'savings' && !metalOf(a)) items.push(item('valuate', '📈', 'Aktualizuj wartość', { close: false }));
     if (g === 'loan') items.push(item('move', '💸', 'Dodaj spłatę', { close: false, extra: 'data-mode="pay"' }));
     items.push(
       item('account-detail', '📜', 'Historia', { close: false }),
@@ -2000,6 +2403,30 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'valuate': openValuationSheet(el.dataset.id); break;
+    case 'del-valuation': {
+      const acc = accById()[el.dataset.id];
+      if (!acc) break;
+      const removed = (acc.valuations || []).find((v) => v.date === el.dataset.date);
+      await db.put('accounts', { ...acc, valuations: (acc.valuations || []).filter((v) => v.date !== el.dataset.date) });
+      await reload();
+      openAccountDetail(acc.id);
+      toast('Usunięto wycenę', { label: 'Cofnij', run: async () => { const cur = accById()[acc.id]; await db.put('accounts', { ...cur, valuations: [...(cur.valuations || []), removed] }); await reload(); } });
+      break;
+    }
+    case 'refresh-prices': refreshMetalPrices({ force: true, silent: false }); break;
+    case 'metal-chart': state.metalChart = el.dataset.m; render(); break;
+    case 'sim-reset': state.simSettings = null; await db.setSetting('simSettings', null); render(); toast('Przywrócono domyślne założenia'); break;
+    case 'sim-ai': {
+      const s2 = simSettings();
+      const r = runSim(s2, simStart());
+      const nowY = Number(todayISO().slice(0, 4));
+      const il = s2.il.on ? investLoanAnalysis({ amount: Math.round(s2.il.amount * 100), rate: s2.il.rate, months: s2.il.months, ret: s2.il.ret, belka: s2.belka }) : null;
+      state.plansTab = 'ai';
+      render();
+      askAI(`Oceń moją symulację majątku na ${s2.years} lat. Założenia: zwroty lokaty ${s2.rSafe}%, ETF ${s2.rMarket}%, IKE ${s2.rRetire}%, metale ${s2.rMetal}%, inflacja ${s2.inflation}%, podatek Belki ${s2.belka ? 'tak' : 'nie'}, nadpłata kredytów ${s2.overpay || 0} zł/mies. Wynik (szacunek): majątek netto w ${nowY + s2.years} r. ok. ${formatMoney(r.final.net)} (po inflacji ${formatMoney(r.final.netReal)}).${il ? ` Kredyt inwestycyjny ${s2.il.amount} zł na ${s2.il.rate}% przez ${s2.il.months} mies., zakładany zysk ${s2.il.ret}%: rata ${formatMoney(il.installment)}, odsetki ${formatMoney(il.interest)}, różnica vs bez kredytu ${formatMoney(il.base.benefit)}, próg opłacalności ${il.breakEven}%.` : ''} Czy założenia są realistyczne i na co uważać?`);
+      break;
+    }
     case 'plans-tab':
       state.plansTab = el.dataset.tab2;
       if (state.view !== 'plans') location.hash = '#plans'; else render();
@@ -2199,6 +2626,8 @@ async function init() {
     await db.migrate();
     state.lastBackup = await db.getSetting('lastBackup', null);
     state.layout = normalizeLayout(await db.getSetting('dashLayout', null));
+    state.prices = await db.getSetting('metalPrices', null);
+    state.simSettings = await db.getSetting('simSettings', null);
     state.prefs.defaultAccount = await db.getSetting('defaultAccount', '') || '';
     state.data = await db.loadAll();
   } catch (err) {
@@ -2207,6 +2636,7 @@ async function init() {
   }
   state.persisted = await db.requestPersistence();
   route();
+  if (hasMetals() || visibleCards(state.layout).includes('metals')) refreshMetalPrices();
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     navigator.serviceWorker.register('sw.js').catch(() => { /* offline niedostępny — aplikacja działa dalej */ });
   }
