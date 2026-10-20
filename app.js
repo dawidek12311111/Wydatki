@@ -10,7 +10,7 @@ import { parseQuick, guessCategory } from './parse.js';
 import { validateTransaction, validateBackup, validateBill, validatePurchase } from './validate.js';
 import { transactionsToCSV } from './csv.js';
 import { ACCOUNT_TYPES, CURRENCIES, SAVINGS_KINDS, PROPERTY_KINDS, BILL_ICONS, accountGroup } from './defaults.js';
-import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, searchImages, CorsBlockedError } from './images.js';
+import { sanitizeImage, isLocalImage, imageFromFile, imageFromUrl, imageViaCanvas, searchImages, CorsBlockedError } from './images.js';
 import { badgeFor, brandOf, initials } from './avatar.js';
 import { hashPin, verifyPin, lockoutSeconds, PIN_RE, biometricAvailable, registerBiometric, verifyBiometric } from './lock.js';
 import { speechSupported, listen } from './voice.js';
@@ -26,7 +26,7 @@ import { DEFAULT_SIM, simulate, investLoanAnalysis, bucketOf } from './sim.js';
 import { buildAIContext, askGemini, checkGeminiKey, renderAIText, DEFAULT_MODEL } from './ai.js';
 import { DASH_CARDS, ACCENTS, TEXT_SIZES, normalizeLayout, moveCard, setCardVisible, visibleCards } from './layout.js';
 
-export const APP_VERSION = '1.0.0';
+export const APP_VERSION = '1.0.1';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -681,6 +681,7 @@ function viewWealth() {
       ${metal ? `<div class="acard-month small">${positionsOf(a).length > 1 ? metalPriceOnly(a) : metalLine(a)}</div>` : ''}
       ${crypto && positionsOf(a).length ? `<div class="acard-month small">${cryptoLine(a)}</div>` : ''}
       ${a.rate ? depositLine(a, bookBal[a.id]) : ''}
+      ${looksLikeProperty(a) ? `<div class="note small" style="margin:6px 0">🏠 To wygląda na nieruchomość — w symulacji liczy się teraz jak inwestycja. <button class="link" data-action="to-property" data-id="${esc(a.id)}">Przenieś do Nieruchomości</button></div>` : ''}
       ${showGain ? `<div class="acard-month small">Wpłacono <span class="num">${esc(formatMoney(r.paidIn, a.currency))}</span> · ${r.gain >= 0 ? 'zysk' : 'strata'} <b class="num ${r.gain >= 0 ? 'pos' : 'neg'}">${esc(formatMoney(r.gain, a.currency, { sign: true }))}${r.gainPct != null ? ` (${esc(fmtPct(r.gainPct * 100))})` : ''}</b></div>` : ''}
       <div class="acard-month small">${m.inflow || m.outflow ? `W tym miesiącu:${m.inflow ? ` <span class="pos num">wpłaty +${esc(formatMoney(m.inflow, a.currency))}</span>` : ''}${m.inflow && m.outflow ? ' ·' : ''}${m.outflow ? ` <span class="neg num">wypłaty −${esc(formatMoney(m.outflow, a.currency))}</span>` : ''}` : 'Brak wpłat i wypłat w tym miesiącu'}</div>
       ${metal || crypto ? positionsHtml(a) : ''}
@@ -763,6 +764,7 @@ function viewWealth() {
       <span class="ico">${accIco(a)}</span>
       <span class="mid"><span class="t1">${esc(a.name)}</span><span class="t2">${esc(accountKindLabel(a))}</span></span>
       <span class="amt num ${bal[a.id] < 0 ? 'neg' : ''}">${esc(formatMoney(bal[a.id], a.currency))}</span></button>`).join('')}</div>
+    ${current.filter(looksLikeProperty).map((a) => `<div class="note small">🏠 „${esc(a.name)}” wygląda na nieruchomość. <button class="link" data-action="to-property" data-id="${esc(a.id)}">Przenieś do Nieruchomości</button></div>`).join('')}
     <div class="actions"><button class="btn block" data-action="add-account" data-group="current">+ Dodaj konto</button></div>
 
     ${archived.length ? `<p class="small muted" style="margin-top:16px">Zarchiwizowane: ${archived.map((a) => `<button class="link" data-action="edit-account" data-id="${esc(a.id)}">${esc(a.name)}</button>`).join(', ')}</p>` : ''}
@@ -828,6 +830,7 @@ function openAccountSheet(id, group) {
   }
   openSheet(title, `${body}
     ${imagePickerHtml()}
+    ${a && (group === 'savings' || group === 'current') ? `<button type="button" class="btn block" data-action="to-property" data-id="${esc(a.id)}" data-close="1" style="margin-top:12px">🏠 Przenieś do „Nieruchomości i inne aktywa”</button>` : ''}
     ${a ? `<label class="check"><input type="checkbox" id="a-arch" ${a.archived ? 'checked' : ''}> Zarchiwizuj (ukryj, historia zostaje)</label>` : ''}
     <div class="err" id="a-err" role="alert"></div>
     <div class="actions ${a ? 'two' : ''}">${a ? `<button class="btn danger" data-action="del-account" data-id="${esc(a.id)}">Usuń</button>` : ''}<button class="btn primary block" id="a-save">Zapisz</button></div>`);
@@ -1508,18 +1511,17 @@ function mountImagePicker(initial, { preview = () => '<span class="muted small">
   };
   paint();
   const fetchInto = async (url) => {
-    status('Pobieram…');
+    status('Zapisuję…');
     try {
-      current = await imageFromUrl(url, 'cover');
-      paint();
-      $('#img-extra').innerHTML = '';
+      current = await imageViaCanvas(url).catch(() => imageFromUrl(url, 'cover'));
       status('✓ Zapisano małą kopię w telefonie — obrazek nie będzie już pobierany z sieci.', 'pos');
-    } catch (err) {
-      if (err instanceof CorsBlockedError) {
-        status(`${esc(err.message)} <button type="button" class="link" id="img-remote">Użyj bezpośrednio z serwera</button> (przy każdym wyświetleniu telefon pobierze go z ${esc(new URL(url).hostname)}; serwer nie dostaje Twoich danych).`, 'neg');
-        $('#img-remote').onclick = () => { current = url; paint(); status('Obrazek będzie wyświetlany z serwera.'); };
-      } else status(esc(err.message), 'neg');
+    } catch {
+      // serwer nie pozwala zrobić kopii — wyświetlamy obrazek bezpośrednio z darmowego serwera
+      current = url;
+      status(`✓ Wybrano. Obrazek będzie wyświetlany z ${esc(new URL(url).hostname)} (serwer nie dostaje żadnych Twoich danych).`, 'pos');
     }
+    paint();
+    $('#img-extra').innerHTML = '';
   };
   const doSearch = async () => {
     const q = $('#img-q').value.trim();
@@ -1527,9 +1529,9 @@ function mountImagePicker(initial, { preview = () => '<span class="muted small">
     status('Szukam…');
     res.innerHTML = '';
     try {
-      const list = await searchImages(q);
+      const { results: list, problems } = await searchImages(q);
       res.innerHTML = list.map((x, i) => `<button type="button" data-pick="${i}" title="${esc(x.title)}${x.creator ? ' — ' + esc(x.creator) : ''} (${esc(x.license)})"><img src="${esc(x.thumb)}" alt="${esc(x.title)}" loading="lazy" referrerpolicy="no-referrer"></button>`).join('');
-      status(`Znaleziono ${list.length}. Dotknij obrazka, żeby go wybrać. Źródła: Openverse i Wikimedia Commons (wolne licencje).`);
+      status(`Znaleziono ${list.length}. Dotknij obrazka, żeby go wybrać. Źródła: Wikimedia Commons i Openverse (wolne licencje).${problems.length ? ` <span class="muted">(${esc(problems.join('; '))})</span>` : ''}`);
       res.onclick = (e) => { const b = e.target.closest('[data-pick]'); if (b) fetchInto(list[Number(b.dataset.pick)].thumb); };
     } catch (err) {
       status(esc(err.message), 'neg');
@@ -2100,6 +2102,7 @@ function viewSim() {
         ${st.loans.map((l) => `<li><div><span>Kredyt: ${esc(l.name)}${l.rateAssumed ? ' <small class="muted">(oprocentowanie założone)</small>' : ''}</span><span class="num neg">−${z(l.balance)}</span></div></li>`).join('')}
         <li><div><span>Średnia nadwyżka (${st.avg.months} mies.)</span><span class="num">${st.avg.months ? z(st.avg.net) : 'brak danych'}</span></div></li>
       </ul>
+      ${state.data.accounts.filter((a) => !a.archived && looksLikeProperty(a)).map((a) => `<p class="note small">🏠 „${esc(a.name)}” jest liczone jak ${accountGroup(a) === 'savings' ? 'inwestycja' : 'pieniądze na koncie'}, a nie nieruchomość. <button class="link" data-action="to-property" data-id="${esc(a.id)}">Przenieś do Nieruchomości</button></p>`).join('')}
       ${st.estimated ? '<p class="small muted">Dla kredytu bez wpisanej raty przyjęto ratę na 10 lat. Wpisz ratę i oprocentowanie w Majątek → kredyt → Edytuj.</p>' : ''}
     </section>
     <section class="card" id="sim-form"><h2>⚙️ Założenia</h2>
@@ -2442,6 +2445,33 @@ function openBatchSheet(prefill = '') {
     await reload();
     toast(`Zapisano ${txs.length + plans.length} operacji`);
   }
+}
+
+// ---------- Przenoszenie do nieruchomości ----------
+const PROPERTY_NAME_RE = /(mieszkan|\bdom\b|domek|działk|dzialk|garaż|garaz|kawalerk|nieruchom|samoch[oó]d|\bauto\b|lokal|apartament)/i;
+function guessPropertyKind(name) {
+  const n = String(name || '').toLowerCase();
+  if (/mieszkan|kawalerk|apartament|lokal/.test(n)) return 'flat';
+  if (/\bdom\b|domek/.test(n)) return 'house';
+  if (/działk|dzialk/.test(n)) return 'land';
+  if (/garaż|garaz/.test(n)) return 'garage';
+  if (/samoch|\bauto\b/.test(n)) return 'car';
+  return 'property_other';
+}
+const looksLikeProperty = (a) => a.type !== 'property' && a.type !== 'loan' && PROPERTY_NAME_RE.test(a.name || '');
+
+async function moveToProperty(id) {
+  const a = accById()[id];
+  if (!a) return;
+  const kind = guessPropertyKind(a.name);
+  const ok = await confirmSheet(`Przenieść „${a.name}” do nieruchomości?`,
+    `Konto trafi do sekcji „Nieruchomości i inne aktywa” jako <b>${esc(PROPERTY_KINDS[kind].label)}</b>. Wartość i historia zostają. W symulacji będzie rosło o ${PROPERTY_KINDS[kind].growth >= 0 ? '+' : ''}${PROPERTY_KINDS[kind].growth}% rocznie (zmienisz w Edytuj), a nie jak lokata czy inwestycja.`,
+    { confirmLabel: 'Przenieś' });
+  if (!ok) return;
+  const { depositKind, rate, termMonths, startDate, promoRate, promoLimit, promoMonths, positions, grams, purity, spread, ...rest } = a;
+  await db.put('accounts', { ...rest, type: 'property', subtype: kind, growth: PROPERTY_KINDS[kind].growth });
+  await reload();
+  toast('Przeniesiono do Nieruchomości');
 }
 
 // ---------- Lokaty i konta oszczędnościowe ----------
@@ -3356,6 +3386,7 @@ async function onAction(e) {
     case 'toggle-bill': toggleBill(el.dataset.id); break;
     case 'copy-bills': openCopySheet(); break;
     case 'plan-fix-tx': fixMissingPlanTx(); break;
+    case 'to-property': moveToProperty(el.dataset.id); break;
     case 'dep-payout': depositAction('payout', el.dataset.id); break;
     case 'dep-renew': depositAction('renew', el.dataset.id); break;
     case 'dep-snooze': depositAction('snooze', el.dataset.id); break;

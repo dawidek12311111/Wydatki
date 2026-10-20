@@ -106,36 +106,100 @@ export async function imageFromUrl(url, fit = 'contain') {
   return shrink(blob, fit);
 }
 
+/** Popularne polskie słowa → angielskie (darmowe bazy obrazków mają dużo więcej opisów po angielsku). */
+const PL_EN = {
+  dom: 'house', mieszkanie: 'apartment', blok: 'apartment building', działka: 'land plot', dzialka: 'land plot', garaż: 'garage', garaz: 'garage',
+  auto: 'car', samochód: 'car', samochod: 'car', rower: 'bicycle', motor: 'motorcycle', bank: 'bank', pieniądze: 'money', pieniadze: 'money',
+  oszczędności: 'savings piggy bank', oszczednosci: 'savings piggy bank', skarbonka: 'piggy bank', lokata: 'savings', emerytura: 'retirement',
+  złoto: 'gold', zloto: 'gold', srebro: 'silver', moneta: 'coin', monety: 'coins', sztabka: 'gold bar', biżuteria: 'jewelry', bizuteria: 'jewelry',
+  wakacje: 'vacation beach', morze: 'sea', góry: 'mountains', gory: 'mountains', jedzenie: 'food', zakupy: 'shopping', sklep: 'shop',
+  prąd: 'electricity', prad: 'electricity', woda: 'water', gaz: 'gas flame', internet: 'internet router', telefon: 'smartphone', telewizja: 'television',
+  dziecko: 'child', dzieci: 'children', przedszkole: 'kindergarten', szkoła: 'school', szkola: 'school', pies: 'dog', kot: 'cat',
+  czynsz: 'rent house', kredyt: 'loan', paliwo: 'fuel station', lekarz: 'doctor', apteka: 'pharmacy', sport: 'sport', siłownia: 'gym', silownia: 'gym',
+  kino: 'cinema', książki: 'books', ksiazki: 'books', remont: 'renovation', kuchnia: 'kitchen', ogród: 'garden', ogrod: 'garden', fotowoltaika: 'solar panels',
+  krypto: 'cryptocurrency', bitcoin: 'bitcoin', akcje: 'stock market', inwestycje: 'investment', praca: 'office work', wypłata: 'salary', wyplata: 'salary',
+};
+export function toEnglishQuery(q) {
+  const words = String(q || '').toLowerCase().trim().split(/\s+/);
+  const tr = words.map((w) => PL_EN[w] || null);
+  return tr.some(Boolean) ? words.map((w, i) => tr[i] || w).join(' ') : null;
+}
+
+function withTimeout(promise, ms, label) {
+  return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error(`${label}: brak odpowiedzi`)), ms))]);
+}
+
+async function searchCommons(q) {
+  const url = `https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=${encodeURIComponent(q)}%20filetype:bitmap&gsrnamespace=6&gsrlimit=24&prop=imageinfo&iiprop=url&iiurlwidth=256`;
+  const r = await fetch(url, { credentials: 'omit' });
+  if (!r.ok) throw new Error(`Wikimedia: błąd ${r.status}`);
+  const j = await r.json();
+  return Object.values(j?.query?.pages || {})
+    .sort((a, b) => (a.index || 0) - (b.index || 0))
+    .map((page) => ({ page, info: page.imageinfo?.[0] }))
+    .filter(({ info }) => info?.thumburl && isAllowedImageUrl(info.thumburl))
+    .map(({ page, info }) => ({ thumb: info.thumburl, title: (page.title || '').replace(/^File:|\.[a-z]+$/gi, ''), creator: '', license: 'Wikimedia Commons', source: 'Wikimedia' }));
+}
+
+async function searchOpenverse(q) {
+  const r = await fetch(`https://api.openverse.org/v1/images/?q=${encodeURIComponent(q)}&page_size=18&mature=false`, { credentials: 'omit' });
+  if (!r.ok) throw new Error(`Openverse: błąd ${r.status}`);
+  const j = await r.json();
+  return (j?.results || []).filter((x) => x.thumbnail && isAllowedImageUrl(x.thumbnail))
+    .map((x) => ({ thumb: x.thumbnail, title: x.title || '', creator: x.creator || '', license: `${(x.license || '').toUpperCase()} ${x.license_version || ''}`.trim(), source: 'Openverse' }));
+}
+
 /**
- * Szukanie darmowych obrazków po tagu (Openverse + Wikimedia Commons).
- * Wysyłane jest tylko wpisane słowo — żadne Twoje dane.
- * Zwraca [{ thumb, title, creator, license, source }].
+ * Szukanie darmowych obrazków po tagu (Wikimedia Commons + Openverse; polskie słowa także po angielsku).
+ * Wysyłane jest tylko wpisane słowo — żadne Twoje dane. Zwraca { results, problems }.
  */
 export async function searchImages(query) {
   const q = String(query || '').trim();
   if (!q) throw new Error('Wpisz słowo, np. dom, auto, wakacje');
   if (!navigator.onLine) throw new Error('Brak internetu');
-  const enc = encodeURIComponent(q);
-  const opts = { credentials: 'omit', referrerPolicy: 'no-referrer' };
-  const out = [];
-  const tasks = [
-    fetch(`https://api.openverse.org/v1/images/?q=${enc}&page_size=18&mature=false`, opts)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j) => {
-        for (const x of j?.results || []) {
-          if (x.thumbnail && isAllowedImageUrl(x.thumbnail)) out.push({ thumb: x.thumbnail, title: x.title || '', creator: x.creator || '', license: `${(x.license || '').toUpperCase()} ${x.license_version || ''}`.trim(), source: 'Openverse' });
-        }
-      }).catch(() => {}),
-    fetch(`https://commons.wikimedia.org/w/api.php?action=query&format=json&origin=*&generator=search&gsrsearch=${enc}%20filetype:bitmap&gsrnamespace=6&gsrlimit=18&prop=imageinfo&iiprop=url&iiurlwidth=256`, opts)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((j) => {
-        for (const page of Object.values(j?.query?.pages || {})) {
-          const info = page.imageinfo?.[0];
-          if (info?.thumburl && isAllowedImageUrl(info.thumburl)) out.push({ thumb: info.thumburl, title: (page.title || '').replace(/^File:|\.[a-z]+$/gi, ''), creator: '', license: 'Wikimedia Commons', source: 'Wikimedia' });
-        }
-      }).catch(() => {}),
-  ];
-  await Promise.all(tasks);
-  if (!out.length) throw new Error('Nic nie znaleziono — spróbuj innego słowa (także po angielsku, np. house, car)');
-  return out.slice(0, 30);
+  const en = toEnglishQuery(q);
+  const jobs = [['Wikimedia', () => searchCommons(q)], ['Openverse', () => searchOpenverse(q)]];
+  if (en && en !== q.toLowerCase()) jobs.push(['Wikimedia (ang.)', () => searchCommons(en)], ['Openverse (ang.)', () => searchOpenverse(en)]);
+  const settled = await Promise.allSettled(jobs.map(([label, fn]) => withTimeout(fn(), 9000, label)));
+  const seen = new Set();
+  const results = [];
+  const problems = [];
+  settled.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      const m = String(r.reason?.message || '');
+      problems.push(m.startsWith(jobs[i][0].split(' ')[0]) ? m : `${jobs[i][0]}: brak połączenia`);
+      return;
+    }
+    for (const x of r.value) if (!seen.has(x.thumb)) { seen.add(x.thumb); results.push(x); }
+  });
+  if (!results.length) {
+    throw new Error(problems.length === jobs.length
+      ? `Nie udało się połączyć z wyszukiwarkami (${problems.join('; ')}). Sprawdź internet lub spróbuj za chwilę.`
+      : 'Nic nie znaleziono — spróbuj innego słowa (np. po angielsku: house, car)');
+  }
+  return { results: results.slice(0, 36), problems };
+}
+
+/** Zmniejszona kopia obrazka z serwera przez <img crossorigin> (bez fetch) — działa, gdy serwer na to pozwala. */
+export function imageViaCanvas(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.referrerPolicy = 'no-referrer';
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = ICON_SIZE; c.height = ICON_SIZE;
+        const g = c.getContext('2d');
+        const w = img.naturalWidth || ICON_SIZE; const h = img.naturalHeight || ICON_SIZE;
+        const sc = Math.max(ICON_SIZE / w, ICON_SIZE / h);
+        g.drawImage(img, (ICON_SIZE - w * sc) / 2, (ICON_SIZE - h * sc) / 2, w * sc, h * sc);
+        let out = c.toDataURL('image/webp', 0.85);
+        if (!out.startsWith('data:image/webp')) out = c.toDataURL('image/png');
+        resolve(out);
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error('Nie udało się wczytać obrazka'));
+    img.src = url;
+  });
 }
